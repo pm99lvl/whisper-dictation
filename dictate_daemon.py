@@ -82,7 +82,7 @@ def transcribe_and_paste(audio: np.ndarray):
         print("⚙️  Transcribing...", flush=True)
         result = mlx_whisper.transcribe(
             tmp, path_or_hf_repo=MODEL, language=None, word_timestamps=False,
-            condition_on_previous_text=False)  # предотвращает галлюцинаторные петли
+            condition_on_previous_text=False)
         text = result["text"].strip()
         if not text:
             notify("Whisper", "Текст не распознан")
