@@ -1,4 +1,4 @@
--- Whisper Dictation — Удержи Left Alt = запись, отпусти = транскрибирование
+-- Whisper Dictation — Left Alt (удержать) = RU, Right Alt (удержать) = EN перевод
 
 local PYTHON        = "/Users/a1/.pyenv/versions/3.11.11/bin/python3"
 local DAEMON        = "/Users/a1/.whisper-dictation/dictate_daemon.py"
@@ -23,8 +23,10 @@ styleGreen.strokeColor = {red=0.2,green=0.85,blue=0.2,alpha=1}
 local styleGray = hs.fnutils.copy(styleRed)
 styleGray.strokeColor = {red=0.5,green=0.5,blue=0.5,alpha=1}
 
-local recAlertId      = nil
-local sessionStarted  = false  -- отслеживает, что мы сами отправили start
+local recAlertId     = nil
+local sessionStarted = false
+local LALT           = 58
+local RALT           = 61
 
 local function sendCmd(cmd)
     hs.execute("echo '" .. cmd .. "' | nc -U " .. SOCKET .. " 2>/dev/null")
@@ -84,36 +86,31 @@ local function startDaemon()
     end)
 end
 
--- ── Хоткей: удержание Left Alt ────────────────────────────────────
+-- ── Общая функция начала/конца записи ─────────────────────────────
+local function saveFocusApp()
+    local focusApp = hs.application.frontmostApplication()
+    if focusApp then
+        local ff = io.open(FOCUS_FILE, "w")
+        if ff then ff:write(focusApp:name()); ff:close() end
+    end
+end
+
+-- ── Left Alt — диктовка на русском ────────────────────────────────
 whisperTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
     if event:getKeyCode() ~= LALT then return false end
     local flags = event:getFlags()
 
     if flags.alt then
-        -- Alt нажат → начать запись
         sessionStarted = false
-
-        if not isDaemonAlive() then
-            startDaemon()
-            return false
-        end
-
-        -- Запоминаем активное приложение ДО начала записи
-        local focusApp = hs.application.frontmostApplication()
-        if focusApp then
-            local ff = io.open(FOCUS_FILE, "w")
-            if ff then ff:write(focusApp:name()); ff:close() end
-        end
-
+        if not isDaemonAlive() then startDaemon(); return false end
+        saveFocusApp()
         hs.sound.getByName("Tink"):play()
         recAlertId = hs.alert.show("  🎙  Диктую...  ", styleRed, 99)
         sendCmd("start")
         sessionStarted = true
     else
-        -- Alt отпущен → остановить запись
         if not sessionStarted then return false end
         sessionStarted = false
-
         if recAlertId then hs.alert.closeSpecific(recAlertId); recAlertId = nil end
         hs.alert.show("  ⚙️  Транскрибирую...  ", styleGreen, 4)
         sendCmd("stop")
@@ -121,6 +118,30 @@ whisperTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(ev
     return false
 end)
 whisperTap:start()
+
+-- ── Right Alt — диктовка с переводом на английский ────────────────
+whisperTranslateTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
+    if event:getKeyCode() ~= RALT then return false end
+    local flags = event:getFlags()
+
+    if flags.alt then
+        sessionStarted = false
+        if not isDaemonAlive() then startDaemon(); return false end
+        saveFocusApp()
+        hs.sound.getByName("Tink"):play()
+        recAlertId = hs.alert.show("  🌐  Диктую → EN...  ", styleRed, 99)
+        sendCmd("start_translate")
+        sessionStarted = true
+    else
+        if not sessionStarted then return false end
+        sessionStarted = false
+        if recAlertId then hs.alert.closeSpecific(recAlertId); recAlertId = nil end
+        hs.alert.show("  ⚙️  Перевожу на EN...  ", styleGreen, 4)
+        sendCmd("stop_translate")
+    end
+    return false
+end)
+whisperTranslateTap:start()
 
 -- Авто-убирать алерт если запись завершилась по тишине
 hs.timer.new(0.5, function()

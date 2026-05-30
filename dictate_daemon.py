@@ -75,15 +75,27 @@ def apply_punct_commands(text: str) -> str:
     return text.strip()
 
 
-def transcribe_and_paste(audio: np.ndarray):
+def transcribe_and_paste(audio: np.ndarray, translate: bool = False):
     tmp = tempfile.mktemp(suffix=".wav")
     wf.write(tmp, SAMPLE_RATE, (audio * 32767).astype(np.int16))
     try:
-        print("⚙️  Transcribing...", flush=True)
-        result = mlx_whisper.transcribe(
-            tmp, path_or_hf_repo=MODEL, language=None, word_timestamps=False,
-            condition_on_previous_text=False)
-        text = result["text"].strip()
+        if translate:
+            print("⚙️  Transcribing (ru)...", flush=True)
+            result = mlx_whisper.transcribe(
+                tmp, path_or_hf_repo=MODEL, language="ru", word_timestamps=False,
+                condition_on_previous_text=False)
+            text = result["text"].strip()
+            if text:
+                print(f"   RU: {text}", flush=True)
+                from deep_translator import GoogleTranslator
+                text = GoogleTranslator(source="ru", target="en").translate(text)
+                print(f"⚙️  → EN: {text}", flush=True)
+        else:
+            print("⚙️  Transcribing...", flush=True)
+            result = mlx_whisper.transcribe(
+                tmp, path_or_hf_repo=MODEL, language=None, word_timestamps=False,
+                condition_on_previous_text=False)
+            text = result["text"].strip()
         if not text:
             notify("Whisper", "Текст не распознан")
             return
@@ -104,9 +116,9 @@ def transcribe_and_paste(audio: np.ndarray):
         except: pass
 
 
-def record_thread():
+def record_thread(translate: bool = False):
     global _recording, _transcribing
-    print("🎙 Recording...", flush=True)
+    print(f"🎙 Recording... (translate={translate})", flush=True)
 
     with open(STATE_FILE, "w") as f:
         f.write("recording")
@@ -118,10 +130,21 @@ def record_thread():
     elapsed         = 0.0
     max_rms         = 0.0
 
+    # Выбираем устройство: предпочитаем встроенный мик MacBook
+    def find_builtin_mic():
+        for i, d in enumerate(sd.query_devices()):
+            if d['max_input_channels'] > 0 and 'MacBook' in d['name']:
+                return i
+        return None
+
+    device = find_builtin_mic()
+    if device is not None:
+        print(f"🎤 Using: {sd.query_devices(device)['name']}", flush=True)
+
     try:
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                             blocksize=int(SAMPLE_RATE * 0.1),
-                            latency="high") as stream:  # latency=high → большой буфер, нет дропов
+                            latency="high", device=device) as stream:
             for _ in range(int(MAX_SECONDS / 0.1)):
                 if _stop_event.is_set():
                     print("⏹  Stop by hotkey", flush=True)
@@ -139,12 +162,20 @@ def record_thread():
                     if silent_chunks >= int(SILENCE_AFTER / 0.1):
                         print("🔇 Silence stop", flush=True)
                         break
+    except Exception as e:
+        print(f"⚠️  InputStream error: {e}", flush=True)
+        notify("Whisper", f"Ошибка микрофона: {e}")
     finally:
         try: os.remove(STATE_FILE)
         except: pass
+        # Сбрасываем флаг ВСЕГДА — даже если InputStream упал
+        with _lock:
+            _recording = False
+
+    if not frames:
+        return
 
     with _lock:
-        _recording = False
         _transcribing = True
 
     try:
@@ -158,13 +189,13 @@ def record_thread():
             notify("Whisper", "Речь не обнаружена")
             return
 
-        transcribe_and_paste(audio)
+        transcribe_and_paste(audio, translate=translate)
     finally:
         with _lock:
             _transcribing = False
 
 
-def handle_start():
+def handle_start(translate: bool = False):
     global _recording
     with _lock:
         if _recording:
@@ -175,7 +206,7 @@ def handle_start():
             return
         _recording = True
         _stop_event.clear()
-    threading.Thread(target=record_thread, daemon=True).start()
+    threading.Thread(target=record_thread, args=(translate,), daemon=True).start()
 
 
 def handle_stop():
@@ -217,8 +248,12 @@ while True:
             conn.close()
         print(f"CMD: {cmd}", flush=True)
         if cmd == "start":
-            handle_start()
+            handle_start(translate=False)
         elif cmd == "stop":
+            handle_stop()
+        elif cmd == "start_translate":
+            handle_start(translate=True)
+        elif cmd == "stop_translate":
             handle_stop()
         elif cmd == "quit":
             cleanup()
