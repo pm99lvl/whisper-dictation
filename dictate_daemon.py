@@ -16,7 +16,7 @@ with open(_PID_FILE_EARLY, "w") as _f:
 
 MODEL             = "mlx-community/whisper-large-v3-turbo"
 SAMPLE_RATE       = 16000
-MAX_SECONDS       = 300    # до 5 минут
+MAX_SECONDS       = 60     # максимум 60 секунд — защита от зависания
 SPEECH_THRESHOLD  = 0.0008
 SILENCE_AFTER     = 5.0    # 5 секунд тишины после речи → авто-стоп
 MIN_RECORD_TIME   = 1.0
