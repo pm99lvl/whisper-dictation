@@ -18,7 +18,7 @@ MODEL             = "mlx-community/whisper-small-mlx"
 SAMPLE_RATE       = 16000
 MAX_SECONDS       = 60     # максимум 60 секунд — защита от зависания
 SPEECH_THRESHOLD  = 0.0008
-SILENCE_AFTER     = 2.5    # 2.5с тишины после речи → авто-стоп (золотая середина для пауз)
+SILENCE_AFTER     = 10.0   # 10с тишины после речи → авто-стоп (для длинных текстов с паузами)
 MIN_RECORD_TIME   = 1.0
 
 SOCKET_PATH   = "/tmp/whisper_daemon.sock"
