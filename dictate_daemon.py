@@ -11,6 +11,7 @@ Persistent local daemon for macOS dictation:
 from __future__ import annotations
 
 import os
+import json
 import queue
 import re
 import signal
@@ -23,11 +24,9 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
-os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+from dictation_runtime import RuntimeState, cleanup_stale_files, is_process_alive, write_json_atomic
 
-# Write PID before model preload so Hammerspoon does not kill us while loading.
-PID_FILE = Path("/tmp/whisper_daemon.pid")
-PID_FILE.write_text(str(os.getpid()))
+os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
 MODEL = "mlx-community/whisper-small-mlx"
 SAMPLE_RATE = 16000
@@ -41,8 +40,30 @@ INNER_SILENCE_KEEP_SECONDS = 0.6
 
 SOCKET_PATH = Path("/tmp/whisper_daemon.sock")
 STATE_FILE = Path("/tmp/whisper_dictation_state")
+PID_FILE = Path("/tmp/whisper_daemon.pid")
 RESULT_FILE = Path("/tmp/whisper_result.txt")
 TRIGGER_FILE = Path("/tmp/whisper_paste.trigger")
+STATUS_FILE = Path("/tmp/whisper_status.json")
+
+if PID_FILE.exists():
+    existing_pid = PID_FILE.read_text().strip()
+    if existing_pid and existing_pid != str(os.getpid()) and is_process_alive(existing_pid):
+        print(f"🟡 Existing daemon already alive (pid={existing_pid}); exiting duplicate before model load", flush=True)
+        sys.exit(0)
+
+removed_startup_artifacts = cleanup_stale_files(
+    socket_path=SOCKET_PATH,
+    state_path=STATE_FILE,
+    pid_path=PID_FILE,
+    result_path=RESULT_FILE,
+    trigger_path=TRIGGER_FILE,
+    glob_root=Path("/tmp"),
+)
+if removed_startup_artifacts:
+    print(f"🧹 Removed stale artifacts: {removed_startup_artifacts}", flush=True)
+
+# Write PID before model preload so Hammerspoon does not kill us while loading.
+PID_FILE.write_text(str(os.getpid()))
 
 import numpy as np
 import scipy.io.wavfile as wf
@@ -67,7 +88,8 @@ _recording = False
 _transcribing = False
 _stop_event = threading.Event()
 _lock = threading.Lock()
-_transcription_queue: queue.Queue[tuple[np.ndarray, bool]] = queue.Queue()
+_runtime_state = RuntimeState()
+_transcription_queue: queue.Queue[tuple[str, np.ndarray, bool]] = queue.Queue()
 _translator_ru_en: GoogleTranslator | None = None
 _input_device: int | None = None
 _input_device_name: str | None = None
@@ -88,6 +110,42 @@ DUPLICATE_TERMINATOR_RE = re.compile(r"[.,]\s*([?!])")
 
 def log_timing(label: str, start: float) -> None:
     print(f"⏱ {label}: {time.perf_counter() - start:.2f}s", flush=True)
+
+
+def emit_event(event: str, *, session_id: str | None = None, **payload) -> None:
+    fields = {
+        "event": event,
+        "pid": os.getpid(),
+        "session_id": session_id or _runtime_state.session_id,
+        "state": _runtime_state.state,
+        "queue_size": _transcription_queue.qsize(),
+        **payload,
+    }
+    parts = [f"{key}={value}" for key, value in fields.items() if value is not None]
+    print("🧾 " + " ".join(parts), flush=True)
+    write_status()
+
+
+def status_payload() -> dict:
+    snapshot = _runtime_state.snapshot()
+    snapshot.update(
+        {
+            "ok": True,
+            "pid": os.getpid(),
+            "model": MODEL,
+            "recording": _recording,
+            "transcribing": _transcribing,
+            "queue_size": _transcription_queue.qsize(),
+            "socket_path": str(SOCKET_PATH),
+            "status_file": str(STATUS_FILE),
+        }
+    )
+    return snapshot
+
+
+def write_status() -> None:
+    with suppress(Exception):
+        write_json_atomic(STATUS_FILE, status_payload())
 
 
 def notify(title: str, msg: str) -> None:
@@ -198,7 +256,7 @@ def compact_silence(audio: np.ndarray) -> np.ndarray:
     return compacted
 
 
-def transcribe_and_paste(audio: np.ndarray, translate: bool = False) -> None:
+def transcribe_and_paste(session_id: str, audio: np.ndarray, translate: bool = False) -> None:
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
     try:
@@ -206,6 +264,8 @@ def transcribe_and_paste(audio: np.ndarray, translate: bool = False) -> None:
         wf.write(tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
 
         if translate:
+            _runtime_state.mark_transcribing()
+            emit_event("transcribe_start", session_id=session_id, mode="translate")
             print("⚙️  Transcribing (ru)...", flush=True)
             started = time.perf_counter()
             result = mlx_whisper.transcribe(
@@ -219,11 +279,15 @@ def transcribe_and_paste(audio: np.ndarray, translate: bool = False) -> None:
             text = result["text"].strip()
             if text:
                 print(f"   RU: {text}", flush=True)
+                _runtime_state.mark_translating()
+                emit_event("translate_start", session_id=session_id)
                 started = time.perf_counter()
                 text = get_translator().translate(text)
                 log_timing("translate_ru_en", started)
                 print(f"⚙️  → EN: {text}", flush=True)
         else:
+            _runtime_state.mark_transcribing()
+            emit_event("transcribe_start", session_id=session_id, mode="dictation")
             print("⚙️  Transcribing...", flush=True)
             started = time.perf_counter()
             result = mlx_whisper.transcribe(
@@ -246,28 +310,34 @@ def transcribe_and_paste(audio: np.ndarray, translate: bool = False) -> None:
         text = apply_punct_commands(text)
         print(f"✅ {text}", flush=True)
         started = time.perf_counter()
+        _runtime_state.mark_ready_to_paste()
         write_result_for_hammerspoon(text)
         log_timing("handoff_to_hammerspoon", started)
+        emit_event("result_ready", session_id=session_id, chars=len(text))
     finally:
         with suppress(FileNotFoundError):
             os.unlink(tmp.name)
 
 
-def enqueue_transcription(audio: np.ndarray, translate: bool) -> None:
-    _transcription_queue.put((audio, translate))
-    print(f"📥 Queued transcription (translate={translate}, queue={_transcription_queue.qsize()})", flush=True)
+def enqueue_transcription(session_id: str, audio: np.ndarray, translate: bool) -> None:
+    _transcription_queue.put((session_id, audio, translate))
+    _runtime_state.mark_queued(_transcription_queue.qsize())
+    print(f"📥 Queued transcription (session={session_id}, translate={translate}, queue={_transcription_queue.qsize()})", flush=True)
+    emit_event("queued", session_id=session_id, translate=translate)
 
 
 def transcription_worker() -> None:
     global _transcribing
     while True:
-        audio, translate = _transcription_queue.get()
+        session_id, audio, translate = _transcription_queue.get()
         with _lock:
             _transcribing = True
         started = time.perf_counter()
         try:
-            transcribe_and_paste(audio, translate=translate)
+            transcribe_and_paste(session_id, audio, translate=translate)
         except Exception as exc:
+            _runtime_state.mark_error(str(exc))
+            emit_event("transcription_error", session_id=session_id, error=exc)
             print(f"⚠️  Transcription job failed: {exc}", flush=True)
             notify("Whisper", f"Ошибка транскрипции: {exc}")
         finally:
@@ -275,12 +345,17 @@ def transcription_worker() -> None:
             _transcription_queue.task_done()
             with _lock:
                 _transcribing = not _transcription_queue.empty()
+                recording_now = _recording
+            if not _transcribing and not recording_now:
+                _runtime_state.mark_done()
+            write_status()
 
 
-def record_thread(translate: bool = False) -> None:
+def record_thread(session_id: str, translate: bool = False) -> None:
     global _recording
-    print(f"🎙 Recording... (translate={translate})", flush=True)
-    STATE_FILE.write_text("recording")
+    print(f"🎙 Recording... (session={session_id}, translate={translate})", flush=True)
+    STATE_FILE.write_text(session_id)
+    emit_event("recording_started", session_id=session_id, translate=translate)
 
     frames: list[np.ndarray] = []
     chunk = int(SAMPLE_RATE * BLOCK_SECONDS)
@@ -319,6 +394,8 @@ def record_thread(translate: bool = False) -> None:
                         print("🔇 Silence stop", flush=True)
                         break
     except Exception as exc:
+        _runtime_state.mark_error(str(exc))
+        emit_event("input_error", session_id=session_id, error=exc)
         print(f"⚠️  InputStream error: {exc}", flush=True)
         notify("Whisper", f"Ошибка микрофона: {exc}")
     finally:
@@ -328,42 +405,52 @@ def record_thread(translate: bool = False) -> None:
             _recording = False
 
     if not frames:
+        emit_event("recording_empty", session_id=session_id)
         return
 
     if len(frames) < 5:
+        emit_event("recording_too_short", session_id=session_id, frames=len(frames))
         print("⚠️  Too short", flush=True)
         return
 
     audio = np.concatenate(frames).flatten()
     if not speech_detected:
+        emit_event("no_speech", session_id=session_id, max_rms=f"{max_rms:.4f}")
         print(f"⚠️  No speech (max RMS={max_rms:.4f}, threshold={SPEECH_THRESHOLD})", flush=True)
         notify("Whisper", "Речь не обнаружена")
         return
 
-    enqueue_transcription(audio, translate=translate)
+    enqueue_transcription(session_id, audio, translate=translate)
 
 
 def handle_start(translate: bool = False) -> None:
     global _recording
+    mode = "translate" if translate else "dictation"
     with _lock:
         if _recording:
             print("Already recording — ignoring start", flush=True)
+            emit_event("start_rejected", reason="already_recording", mode=mode)
             return
         if _transcribing:
             print("Still transcribing — recording next phrase concurrently", flush=True)
+            emit_event("start_during_transcription", mode=mode)
+        session_id = _runtime_state.start_recording(mode=mode)
         _recording = True
         _stop_event.clear()
-    threading.Thread(target=record_thread, args=(translate,), daemon=True).start()
+    threading.Thread(target=record_thread, args=(session_id, translate), daemon=True).start()
 
 
 def handle_stop() -> None:
     _stop_event.set()
+    _runtime_state.stop_recording()
     with suppress(FileNotFoundError):
         STATE_FILE.unlink()
     print("⏹  Stop requested", flush=True)
+    emit_event("stop_requested")
 
 
 def cleanup(sig=None, frame=None) -> None:  # noqa: ARG001 - signal handler signature
+    emit_event("shutdown")
     for path in (SOCKET_PATH, PID_FILE, STATE_FILE):
         with suppress(FileNotFoundError):
             path.unlink()
@@ -383,30 +470,39 @@ def serve() -> None:
     os.chmod(SOCKET_PATH, 0o600)
     PID_FILE.write_text(str(os.getpid()))
     threading.Thread(target=transcription_worker, daemon=True).start()
+    write_status()
 
     print(f"🟢 Daemon listening on {SOCKET_PATH}", flush=True)
+    emit_event("ready")
     while True:
         try:
             conn, _ = server.accept()
             try:
                 cmd = conn.recv(32).decode().strip()
+                print(f"CMD: {cmd}", flush=True)
+                response = "OK\n"
+                if cmd == "start":
+                    handle_start(translate=False)
+                elif cmd == "stop":
+                    handle_stop()
+                elif cmd == "start_translate":
+                    handle_start(translate=True)
+                elif cmd == "stop_translate":
+                    handle_stop()
+                elif cmd == "ping":
+                    response = "pong\n"
+                elif cmd == "status":
+                    response = json.dumps(status_payload(), ensure_ascii=False, sort_keys=True) + "\n"
+                elif cmd == "quit":
+                    response = "quitting\n"
+                    conn.sendall(response.encode())
+                    cleanup()
+                else:
+                    response = "ERR unknown command\n"
+                    print(f"⚠️  Unknown command: {cmd}", flush=True)
+                conn.sendall(response.encode())
             finally:
                 conn.close()
-            print(f"CMD: {cmd}", flush=True)
-            if cmd == "start":
-                handle_start(translate=False)
-            elif cmd == "stop":
-                handle_stop()
-            elif cmd == "start_translate":
-                handle_start(translate=True)
-            elif cmd == "stop_translate":
-                handle_stop()
-            elif cmd == "ping":
-                pass
-            elif cmd == "quit":
-                cleanup()
-            else:
-                print(f"⚠️  Unknown command: {cmd}", flush=True)
         except Exception as exc:
             print(f"Error: {exc}", flush=True)
 

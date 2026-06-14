@@ -94,6 +94,10 @@ local function startDaemon()
     end)
 end
 
+local function daemonStatus()
+    return hs.execute("printf status | nc -U -w1 " .. SOCKET .. " 2>/dev/null")
+end
+
 local function saveFocusApp()
     local app = hs.application.frontmostApplication()
     if app then
@@ -200,6 +204,17 @@ screenshotTap = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(even
     return false
 end)
 screenshotTap:start()
+
+-- Watchdog: keep daemon alive and refresh status snapshot without touching active recordings.
+daemonWatchdog = hs.timer.new(15, function()
+    if not isDaemonAlive() and not isDaemonProcessRunning() then
+        hs.alert.show("  ⚠️  Whisper демон умер — перезапускаю...  ", styleGray, 3)
+        startDaemon()
+    else
+        daemonStatus()
+    end
+end)
+daemonWatchdog:start()
 
 startDaemon()
 require("hs.ipc")

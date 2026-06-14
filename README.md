@@ -67,18 +67,34 @@ tail -f /tmp/whisper_dictation.log
 # Check socket health
 echo ping | nc -U -w1 /tmp/whisper_daemon.sock
 
+# Runtime status as JSON
+printf status | nc -U -w1 /tmp/whisper_daemon.sock | python3 -m json.tool
+
+# Last persisted status snapshot
+python3 -m json.tool /tmp/whisper_status.json
+
 # Compile-check Python files
-python3 -m py_compile dictate_daemon.py dictate.py dictate_standalone.py
+python3 -m py_compile dictation_runtime.py dictate_daemon.py dictate.py dictate_standalone.py
 ```
 
 Useful log markers:
 
+- `🧾 event=... session_id=... state=...` — structured runtime event.
+- `state: idle|recording|queued|transcribing|translating|ready_to_paste|done|error` — state-machine snapshot in `status`.
 - `⏱ transcribe_ru: ...s` — local Whisper transcription time.
 - `⏱ translate_ru_en: ...s` — network translation time.
 - `⏱ handoff_to_hammerspoon: ...s` — file handoff time.
 - `📥 Queued transcription ...` — a completed recording was queued for transcription.
 - `Still transcribing — recording next phrase concurrently` — a new recording started while the previous phrase was still being processed; it is no longer dropped.
 - `⏱ transcription_job_total: ...s` — total time for one queued transcription/translation job.
+
+## Resiliency
+
+- `dictation_runtime.py` contains testable runtime helpers: session IDs, state snapshots, atomic JSON writes, stale-file cleanup, and process liveness checks.
+- Daemon startup refuses duplicate instances before model load if `/tmp/whisper_daemon.pid` points to a live process.
+- Startup removes stale socket/state/result/trigger artifacts when no live daemon owns them.
+- `status` socket command and `/tmp/whisper_status.json` expose the current runtime state for Hammerspoon/watchdogs.
+- Transcription jobs are queued instead of dropping new recordings while the previous job is still finishing.
 
 ## Voice punctuation commands
 

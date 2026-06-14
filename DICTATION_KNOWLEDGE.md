@@ -109,11 +109,31 @@ killall Hammerspoon && open -a Hammerspoon
 - `⏱ handoff_to_hammerspoon: ...s` — время атомарной передачи результата Hammerspoon.
 - `📥 Queued transcription ...` — запись завершилась и поставлена в очередь обработки.
 - `Still transcribing — recording next phrase concurrently` — новая запись началась параллельно с обработкой предыдущей; старт больше не теряется.
-- `⏱ transcription_job_total: ...s` — полное время одной queued-задачи.
+- `Still transcribing — ignoring start` — старый проблемный маркер; если снова появился, значит новая запись снова теряется и это регрессия.
+
+### Resiliency runtime
+
+В ветке `feature/resilient-runtime` добавлены:
+
+- `dictation_runtime.py` — тестируемые хелперы для session_id, state snapshot, atomic JSON write, stale-file cleanup, process liveness.
+- `test_runtime.py` — unittest-покрытие runtime-хелперов без внешних зависимостей.
+- Single-instance guard: второй демон выходит до загрузки модели, если PID-файл указывает на живой процесс.
+- Startup cleanup: stale socket/state/result/trigger удаляются при старте, если живого демона нет.
+- Socket-команда `status`, возвращающая JSON runtime-состояния.
+- `/tmp/whisper_status.json` — persisted status snapshot для watchdog/Hammerspoon.
+- Structured events в логах: `🧾 event=... session_id=... state=... queue_size=...`.
+
+Проверка:
+
+```bash
+printf ping | nc -U -w1 /tmp/whisper_daemon.sock
+printf status | nc -U -w1 /tmp/whisper_daemon.sock | python3 -m json.tool
+python3 -m json.tool /tmp/whisper_status.json
+```
 
 ## 📝 История изменений (Changelog)
 
-- **2026-06-10**: Улучшение отзывчивости: добавлена очередь транскрипции, чтобы новые записи не отбрасывались во время обработки предыдущего перевода.
+- **2026-06-14**: Resiliency runtime: session_id/state/status JSON, single-instance guard, startup cleanup stale-файлов, structured event logs, unittest для runtime-хелперов.
 - **2026-06-10**: Аудит/cleanup: безопасные temp-файлы вместо `mktemp`, атомарная передача результата Hammerspoon, кэширование переводчика и микрофона, тайминги транскрипции/перевода/передачи, синхронизация legacy-файлов с актуальной моделью и timeout.
 - **2026-06-10**: Увеличен `SILENCE_AFTER` до 10.0с для поддержки длинных текстов с паузами. Сменена модель на `whisper-small-mlx`. Реализован хук скрытия алертов при скриншотах. (Commit: `86f7870`)
 - **2026-06-08**: Исправлена вставка текста на русской раскладке (использование keycode 9 вместо символа 'v'). Заменены `hs.canvas` оверлеи на `hs.alert` с перехватом скриншотов.
