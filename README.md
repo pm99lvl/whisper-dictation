@@ -9,7 +9,7 @@ Local macOS voice dictation using [mlx-whisper](https://github.com/ml-explore/ml
 
 The active runtime path is:
 
-1. `dictate_daemon.py` keeps the Whisper model loaded in memory and accepts commands over `/tmp/whisper_daemon.sock`.
+1. `dictate_daemon.py` keeps the Whisper model loaded in memory and accepts commands over `/tmp/whisper_daemon.sock`. Recording and transcription are decoupled: new audio can be recorded while the previous phrase is still being transcribed/translated, and jobs are processed through a single transcription queue.
 2. `hammerspoon_init.lua` handles hotkeys, sends daemon commands, watches `/tmp/whisper_paste.trigger`, and pastes `/tmp/whisper_result.txt` into the saved active app.
 
 ## Performance settings
@@ -76,7 +76,9 @@ Useful log markers:
 - `⏱ transcribe_ru: ...s` — local Whisper transcription time.
 - `⏱ translate_ru_en: ...s` — network translation time.
 - `⏱ handoff_to_hammerspoon: ...s` — file handoff time.
-- `Still transcribing — ignoring start` — a new start command arrived while previous transcription/translation was still running.
+- `📥 Queued transcription ...` — a completed recording was queued for transcription.
+- `Still transcribing — recording next phrase concurrently` — a new recording started while the previous phrase was still being processed; it is no longer dropped.
+- `⏱ transcription_job_total: ...s` — total time for one queued transcription/translation job.
 
 ## Voice punctuation commands
 

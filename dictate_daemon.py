@@ -11,6 +11,7 @@ Persistent local daemon for macOS dictation:
 from __future__ import annotations
 
 import os
+import queue
 import re
 import signal
 import socket
@@ -64,6 +65,7 @@ _recording = False
 _transcribing = False
 _stop_event = threading.Event()
 _lock = threading.Lock()
+_transcription_queue: queue.Queue[tuple[np.ndarray, bool]] = queue.Queue()
 _translator_ru_en: GoogleTranslator | None = None
 _input_device: int | None = None
 _input_device_name: str | None = None
@@ -196,8 +198,32 @@ def transcribe_and_paste(audio: np.ndarray, translate: bool = False) -> None:
             os.unlink(tmp.name)
 
 
+def enqueue_transcription(audio: np.ndarray, translate: bool) -> None:
+    _transcription_queue.put((audio, translate))
+    print(f"📥 Queued transcription (translate={translate}, queue={_transcription_queue.qsize()})", flush=True)
+
+
+def transcription_worker() -> None:
+    global _transcribing
+    while True:
+        audio, translate = _transcription_queue.get()
+        with _lock:
+            _transcribing = True
+        started = time.perf_counter()
+        try:
+            transcribe_and_paste(audio, translate=translate)
+        except Exception as exc:
+            print(f"⚠️  Transcription job failed: {exc}", flush=True)
+            notify("Whisper", f"Ошибка транскрипции: {exc}")
+        finally:
+            log_timing("transcription_job_total", started)
+            _transcription_queue.task_done()
+            with _lock:
+                _transcribing = not _transcription_queue.empty()
+
+
 def record_thread(translate: bool = False) -> None:
-    global _recording, _transcribing
+    global _recording
     print(f"🎙 Recording... (translate={translate})", flush=True)
     STATE_FILE.write_text("recording")
 
@@ -249,23 +275,17 @@ def record_thread(translate: bool = False) -> None:
     if not frames:
         return
 
-    with _lock:
-        _transcribing = True
-    try:
-        if len(frames) < 5:
-            print("⚠️  Too short", flush=True)
-            return
+    if len(frames) < 5:
+        print("⚠️  Too short", flush=True)
+        return
 
-        audio = np.concatenate(frames).flatten()
-        if not speech_detected:
-            print(f"⚠️  No speech (max RMS={max_rms:.4f}, threshold={SPEECH_THRESHOLD})", flush=True)
-            notify("Whisper", "Речь не обнаружена")
-            return
+    audio = np.concatenate(frames).flatten()
+    if not speech_detected:
+        print(f"⚠️  No speech (max RMS={max_rms:.4f}, threshold={SPEECH_THRESHOLD})", flush=True)
+        notify("Whisper", "Речь не обнаружена")
+        return
 
-        transcribe_and_paste(audio, translate=translate)
-    finally:
-        with _lock:
-            _transcribing = False
+    enqueue_transcription(audio, translate=translate)
 
 
 def handle_start(translate: bool = False) -> None:
@@ -275,8 +295,7 @@ def handle_start(translate: bool = False) -> None:
             print("Already recording — ignoring start", flush=True)
             return
         if _transcribing:
-            print("Still transcribing — ignoring start", flush=True)
-            return
+            print("Still transcribing — recording next phrase concurrently", flush=True)
         _recording = True
         _stop_event.clear()
     threading.Thread(target=record_thread, args=(translate,), daemon=True).start()
@@ -308,6 +327,7 @@ def serve() -> None:
     server.listen(5)
     os.chmod(SOCKET_PATH, 0o600)
     PID_FILE.write_text(str(os.getpid()))
+    threading.Thread(target=transcription_worker, daemon=True).start()
 
     print(f"🟢 Daemon listening on {SOCKET_PATH}", flush=True)
     while True:
