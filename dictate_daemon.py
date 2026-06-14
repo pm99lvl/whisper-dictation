@@ -36,6 +36,8 @@ SPEECH_THRESHOLD = 0.0008
 SILENCE_AFTER = 10.0      # allows natural pauses; release Alt for instant stop
 MIN_RECORD_TIME = 1.0
 BLOCK_SECONDS = 0.1
+EDGE_SILENCE_KEEP_SECONDS = 0.2
+INNER_SILENCE_KEEP_SECONDS = 0.6
 
 SOCKET_PATH = Path("/tmp/whisper_daemon.sock")
 STATE_FILE = Path("/tmp/whisper_dictation_state")
@@ -144,10 +146,63 @@ def write_result_for_hammerspoon(text: str) -> None:
     os.replace(tmp_trigger, TRIGGER_FILE)
 
 
+def compact_silence(audio: np.ndarray) -> np.ndarray:
+    """Remove silence that helps recording UX but slows Whisper.
+
+    Users can hold Alt and think for up to SILENCE_AFTER seconds. That is good UX,
+    but sending those silent spans to Whisper is wasted work. Keep speech chunks and
+    short silence padding so phrases remain separated, but drop long empty stretches.
+    """
+    chunk_size = int(SAMPLE_RATE * BLOCK_SECONDS)
+    if len(audio) < chunk_size:
+        return audio
+
+    chunks = [audio[i : i + chunk_size] for i in range(0, len(audio), chunk_size)]
+    rms_values = [float(np.sqrt(np.mean(chunk**2))) if len(chunk) else 0.0 for chunk in chunks]
+    speech_indexes = [i for i, rms in enumerate(rms_values) if rms >= SPEECH_THRESHOLD]
+    if not speech_indexes:
+        return audio
+
+    edge_keep = max(1, int(EDGE_SILENCE_KEEP_SECONDS / BLOCK_SECONDS))
+    inner_keep = max(edge_keep, int(INNER_SILENCE_KEEP_SECONDS / BLOCK_SECONDS))
+    first_speech = max(0, speech_indexes[0] - edge_keep)
+    last_speech = min(len(chunks) - 1, speech_indexes[-1] + edge_keep)
+
+    kept: list[np.ndarray] = []
+    silence_run: list[np.ndarray] = []
+    seen_speech = False
+
+    for idx in range(first_speech, last_speech + 1):
+        chunk = chunks[idx]
+        if rms_values[idx] >= SPEECH_THRESHOLD:
+            if silence_run:
+                kept.extend(silence_run[:inner_keep])
+                silence_run = []
+            kept.append(chunk)
+            seen_speech = True
+        elif seen_speech:
+            silence_run.append(chunk)
+        else:
+            kept.append(chunk)
+
+    if silence_run:
+        kept.extend(silence_run[:edge_keep])
+
+    compacted = np.concatenate(kept).flatten() if kept else audio
+    original_s = len(audio) / SAMPLE_RATE
+    compacted_s = len(compacted) / SAMPLE_RATE
+    if original_s - compacted_s >= 0.2:
+        print(f"✂️  audio_compact: {original_s:.2f}s → {compacted_s:.2f}s", flush=True)
+    else:
+        print(f"✂️  audio_compact: {original_s:.2f}s unchanged", flush=True)
+    return compacted
+
+
 def transcribe_and_paste(audio: np.ndarray, translate: bool = False) -> None:
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
     try:
+        audio = compact_silence(audio)
         wf.write(tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
 
         if translate:
