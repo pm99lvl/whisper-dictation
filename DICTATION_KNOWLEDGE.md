@@ -113,6 +113,8 @@ killall Hammerspoon && open -a Hammerspoon
 
 ### Resiliency runtime
 
+Подробный эксплуатационный playbook: [[RESILIENCY_GUIDE]] / `RESILIENCY_GUIDE.md`.
+
 В ветке `feature/resilient-runtime` добавлены:
 
 - `dictation_runtime.py` — тестируемые хелперы для session_id, state snapshot, atomic JSON write, stale-file cleanup, process liveness.

@@ -90,6 +90,8 @@ Useful log markers:
 
 ## Resiliency
 
+See the full operational playbook: [`RESILIENCY_GUIDE.md`](./RESILIENCY_GUIDE.md).
+
 - `dictation_runtime.py` contains testable runtime helpers: session IDs, state snapshots, atomic JSON writes, stale-file cleanup, and process liveness checks.
 - Daemon startup refuses duplicate instances before model load if `/tmp/whisper_daemon.pid` points to a live process.
 - Startup removes stale socket/state/result/trigger artifacts when no live daemon owns them.
