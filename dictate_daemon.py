@@ -1,174 +1,248 @@
 #!/usr/bin/env python3
 """
 Whisper Dictation Daemon
-Держит модель в памяти — нет overhead на загрузку при каждой диктовке.
-Принимает команды start/stop через Unix socket.
+
+Persistent local daemon for macOS dictation:
+- keeps the MLX Whisper model loaded in memory;
+- accepts start/stop commands over a Unix socket;
+- writes recognized text to /tmp for Hammerspoon to paste.
 """
 
-import sys, os, socket, threading, tempfile, subprocess, time, signal
+from __future__ import annotations
+
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from contextlib import suppress
+from pathlib import Path
 
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
-# Пишем PID сразу — до загрузки модели — чтобы Hammerspoon не убивал нас во время загрузки
-_PID_FILE_EARLY = "/tmp/whisper_daemon.pid"
-with open(_PID_FILE_EARLY, "w") as _f:
-    _f.write(str(os.getpid()))
+# Write PID before model preload so Hammerspoon does not kill us while loading.
+PID_FILE = Path("/tmp/whisper_daemon.pid")
+PID_FILE.write_text(str(os.getpid()))
 
-MODEL             = "mlx-community/whisper-small-mlx"
-SAMPLE_RATE       = 16000
-MAX_SECONDS       = 60     # максимум 60 секунд — защита от зависания
-SPEECH_THRESHOLD  = 0.0008
-SILENCE_AFTER     = 10.0   # 10с тишины после речи → авто-стоп (для длинных текстов с паузами)
-MIN_RECORD_TIME   = 1.0
+MODEL = "mlx-community/whisper-small-mlx"
+SAMPLE_RATE = 16000
+MAX_SECONDS = 60          # safety guard for a stuck hotkey
+SPEECH_THRESHOLD = 0.0008
+SILENCE_AFTER = 10.0      # allows natural pauses; release Alt for instant stop
+MIN_RECORD_TIME = 1.0
+BLOCK_SECONDS = 0.1
 
-SOCKET_PATH   = "/tmp/whisper_daemon.sock"
-STATE_FILE    = "/tmp/whisper_dictation_state"
-PID_FILE      = "/tmp/whisper_daemon.pid"
-RESULT_FILE   = "/tmp/whisper_result.txt"
-TRIGGER_FILE  = "/tmp/whisper_paste.trigger"
-FOCUS_FILE    = "/tmp/whisper_focus_app.txt"
+SOCKET_PATH = Path("/tmp/whisper_daemon.sock")
+STATE_FILE = Path("/tmp/whisper_dictation_state")
+RESULT_FILE = Path("/tmp/whisper_result.txt")
+TRIGGER_FILE = Path("/tmp/whisper_paste.trigger")
 
 import numpy as np
-import sounddevice as sd
 import scipy.io.wavfile as wf
-
-# ── Preload model (один раз при старте) ───────────────────────────
-print("⏳ Loading model...", flush=True)
+import sounddevice as sd
+from deep_translator import GoogleTranslator
 import mlx_whisper
 
-_warmup = tempfile.mktemp(suffix=".wav")
-wf.write(_warmup, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
-mlx_whisper.transcribe(_warmup, path_or_hf_repo=MODEL, language=None, word_timestamps=False)
-os.unlink(_warmup)
+# ── Preload model once ──────────────────────────────────────────────
+print(f"⏳ Loading model: {MODEL}", flush=True)
+_warmup = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+_warmup.close()
+try:
+    wf.write(_warmup.name, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
+    mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language=None, word_timestamps=False)
+finally:
+    with suppress(FileNotFoundError):
+        os.unlink(_warmup.name)
 print("✅ Model ready.", flush=True)
 
-# ── State ─────────────────────────────────────────────────────────
-_recording    = False
+# ── State ───────────────────────────────────────────────────────────
+_recording = False
 _transcribing = False
-_stop_event   = threading.Event()
-_lock         = threading.Lock()
+_stop_event = threading.Event()
+_lock = threading.Lock()
+_translator_ru_en: GoogleTranslator | None = None
+_input_device: int | None = None
+_input_device_name: str | None = None
 
-
-def notify(title, msg):
-    subprocess.run(["osascript", "-e",
-        f'display notification "{msg}" with title "{title}"'], capture_output=True)
-
-
-# Голосовые команды → знаки препинания
+# Voice punctuation commands → symbols.
 PUNCT_COMMANDS = [
-    (r'(?i)\bвопросительный знак\b',  '?'),
-    (r'(?i)\bвосклицательный знак\b', '!'),
-    (r'(?i)\bточка с запятой\b',      ';'),
-    (r'(?i)\bдвоеточие\b',            ':'),
-    (r'(?i)\bмноготочие\b',           '…'),
-    (r'(?i)\bновая строка\b',         '\n'),
-    (r'(?i)\bновый абзац\b',          '\n\n'),
+    (re.compile(r"(?i)\bвопросительный знак\b"), "?"),
+    (re.compile(r"(?i)\bвосклицательный знак\b"), "!"),
+    (re.compile(r"(?i)\bточка с запятой\b"), ";"),
+    (re.compile(r"(?i)\bдвоеточие\b"), ":"),
+    (re.compile(r"(?i)\bмноготочие\b"), "…"),
+    (re.compile(r"(?i)\bновая строка\b"), "\n"),
+    (re.compile(r"(?i)\bновый абзац\b"), "\n\n"),
 ]
+SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([?!;:…])")
+DUPLICATE_TERMINATOR_RE = re.compile(r"[.,]\s*([?!])")
+
+
+def log_timing(label: str, start: float) -> None:
+    print(f"⏱ {label}: {time.perf_counter() - start:.2f}s", flush=True)
+
+
+def notify(title: str, msg: str) -> None:
+    subprocess.run(
+        ["osascript", "-e", f'display notification "{msg}" with title "{title}"'],
+        capture_output=True,
+        check=False,
+    )
+
+
+def get_translator() -> GoogleTranslator:
+    """Create the translator once; constructing it per request adds avoidable latency."""
+    global _translator_ru_en
+    if _translator_ru_en is None:
+        _translator_ru_en = GoogleTranslator(source="ru", target="en")
+    return _translator_ru_en
+
+
+def find_input_device() -> tuple[int | None, str | None]:
+    """Prefer the built-in MacBook microphone; cache result for subsequent recordings."""
+    global _input_device, _input_device_name
+    if _input_device_name is not None:
+        return _input_device, _input_device_name
+
+    for index, device in enumerate(sd.query_devices()):
+        if device["max_input_channels"] > 0 and "MacBook" in device["name"]:
+            _input_device = index
+            _input_device_name = str(device["name"])
+            return _input_device, _input_device_name
+
+    _input_device = None
+    _input_device_name = "default input"
+    return _input_device, _input_device_name
+
 
 def apply_punct_commands(text: str) -> str:
-    import re
     for pattern, replacement in PUNCT_COMMANDS:
-        text = re.sub(pattern, replacement, text)
-    # Убираем пробел перед знаком и лишнюю точку перед ?!
-    text = re.sub(r'\s+([?!;:…])', r'\1', text)
-    text = re.sub(r'[.,]\s*([?!])', r'\1', text)
+        text = pattern.sub(replacement, text)
+    text = SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
+    text = DUPLICATE_TERMINATOR_RE.sub(r"\1", text)
     return text.strip()
 
 
-def transcribe_and_paste(audio: np.ndarray, translate: bool = False):
-    tmp = tempfile.mktemp(suffix=".wav")
-    wf.write(tmp, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+def is_hallucination_loop(text: str) -> bool:
+    words = text.split()
+    return len(words) > 10 and len(set(words)) / len(words) < 0.2
+
+
+def write_result_for_hammerspoon(text: str) -> None:
+    """Write result atomically, then touch trigger so Hammerspoon never reads a partial file."""
+    tmp_result = RESULT_FILE.with_suffix(".txt.tmp")
+    tmp_trigger = TRIGGER_FILE.with_suffix(".trigger.tmp")
+    tmp_result.write_text(text, encoding="utf-8")
+    os.replace(tmp_result, RESULT_FILE)
+    tmp_trigger.write_text("paste")
+    os.replace(tmp_trigger, TRIGGER_FILE)
+
+
+def transcribe_and_paste(audio: np.ndarray, translate: bool = False) -> None:
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
     try:
+        wf.write(tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+
         if translate:
             print("⚙️  Transcribing (ru)...", flush=True)
+            started = time.perf_counter()
             result = mlx_whisper.transcribe(
-                tmp, path_or_hf_repo=MODEL, language="ru", word_timestamps=False,
-                condition_on_previous_text=False)
+                tmp.name,
+                path_or_hf_repo=MODEL,
+                language="ru",
+                word_timestamps=False,
+                condition_on_previous_text=False,
+            )
+            log_timing("transcribe_ru", started)
             text = result["text"].strip()
             if text:
                 print(f"   RU: {text}", flush=True)
-                from deep_translator import GoogleTranslator
-                text = GoogleTranslator(source="ru", target="en").translate(text)
+                started = time.perf_counter()
+                text = get_translator().translate(text)
+                log_timing("translate_ru_en", started)
                 print(f"⚙️  → EN: {text}", flush=True)
         else:
             print("⚙️  Transcribing...", flush=True)
+            started = time.perf_counter()
             result = mlx_whisper.transcribe(
-                tmp, path_or_hf_repo=MODEL, language=None, word_timestamps=False,
-                condition_on_previous_text=False)
+                tmp.name,
+                path_or_hf_repo=MODEL,
+                language=None,
+                word_timestamps=False,
+                condition_on_previous_text=False,
+            )
+            log_timing("transcribe", started)
             text = result["text"].strip()
+
         if not text:
             notify("Whisper", "Текст не распознан")
             return
-        # Детектор галлюцинаций: если >80% слов одинаковые — выбрасываем
-        words = text.split()
-        if len(words) > 10 and len(set(words)) / len(words) < 0.2:
-            print(f"⚠️  Hallucination loop detected ({len(words)} words), discarding", flush=True)
+        if is_hallucination_loop(text):
+            print(f"⚠️  Hallucination loop detected ({len(text.split())} words), discarding", flush=True)
             return
+
         text = apply_punct_commands(text)
         print(f"✅ {text}", flush=True)
-        # Пишем результат в файл — Hammerspoon (с Accessibility) сделает вставку
-        with open(RESULT_FILE, "w", encoding="utf-8") as f:
-            f.write(text)
-        with open(TRIGGER_FILE, "w") as f:
-            f.write("paste")
+        started = time.perf_counter()
+        write_result_for_hammerspoon(text)
+        log_timing("handoff_to_hammerspoon", started)
     finally:
-        try: os.unlink(tmp)
-        except: pass
+        with suppress(FileNotFoundError):
+            os.unlink(tmp.name)
 
 
-def record_thread(translate: bool = False):
+def record_thread(translate: bool = False) -> None:
     global _recording, _transcribing
     print(f"🎙 Recording... (translate={translate})", flush=True)
+    STATE_FILE.write_text("recording")
 
-    with open(STATE_FILE, "w") as f:
-        f.write("recording")
-
-    frames = []
-    chunk  = int(SAMPLE_RATE * 0.1)
+    frames: list[np.ndarray] = []
+    chunk = int(SAMPLE_RATE * BLOCK_SECONDS)
     speech_detected = False
-    silent_chunks   = 0
-    elapsed         = 0.0
-    max_rms         = 0.0
+    silent_chunks = 0
+    elapsed = 0.0
+    max_rms = 0.0
 
-    # Выбираем устройство: предпочитаем встроенный мик MacBook
-    def find_builtin_mic():
-        for i, d in enumerate(sd.query_devices()):
-            if d['max_input_channels'] > 0 and 'MacBook' in d['name']:
-                return i
-        return None
-
-    device = find_builtin_mic()
-    if device is not None:
-        print(f"🎤 Using: {sd.query_devices(device)['name']}", flush=True)
+    device, device_name = find_input_device()
+    print(f"🎤 Using: {device_name}", flush=True)
 
     try:
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                            blocksize=int(SAMPLE_RATE * 0.1),
-                            latency="high", device=device) as stream:
-            for _ in range(int(MAX_SECONDS / 0.1)):
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=chunk,
+            latency="high",
+            device=device,
+        ) as stream:
+            for _ in range(int(MAX_SECONDS / BLOCK_SECONDS)):
                 if _stop_event.is_set():
                     print("⏹  Stop by hotkey", flush=True)
                     break
                 data, _ = stream.read(chunk)
                 frames.append(data.copy())
-                elapsed += 0.1
-                rms = float(np.sqrt(np.mean(data ** 2)))
-                if rms > max_rms: max_rms = rms
+                elapsed += BLOCK_SECONDS
+                rms = float(np.sqrt(np.mean(data**2)))
+                max_rms = max(max_rms, rms)
                 if rms >= SPEECH_THRESHOLD:
                     speech_detected = True
                     silent_chunks = 0
                 elif speech_detected and elapsed >= MIN_RECORD_TIME:
                     silent_chunks += 1
-                    if silent_chunks >= int(SILENCE_AFTER / 0.1):
+                    if silent_chunks >= int(SILENCE_AFTER / BLOCK_SECONDS):
                         print("🔇 Silence stop", flush=True)
                         break
-    except Exception as e:
-        print(f"⚠️  InputStream error: {e}", flush=True)
-        notify("Whisper", f"Ошибка микрофона: {e}")
+    except Exception as exc:
+        print(f"⚠️  InputStream error: {exc}", flush=True)
+        notify("Whisper", f"Ошибка микрофона: {exc}")
     finally:
-        try: os.remove(STATE_FILE)
-        except: pass
-        # Сбрасываем флаг ВСЕГДА — даже если InputStream упал
+        with suppress(FileNotFoundError):
+            STATE_FILE.unlink()
         with _lock:
             _recording = False
 
@@ -177,7 +251,6 @@ def record_thread(translate: bool = False):
 
     with _lock:
         _transcribing = True
-
     try:
         if len(frames) < 5:
             print("⚠️  Too short", flush=True)
@@ -195,7 +268,7 @@ def record_thread(translate: bool = False):
             _transcribing = False
 
 
-def handle_start(translate: bool = False):
+def handle_start(translate: bool = False) -> None:
     global _recording
     with _lock:
         if _recording:
@@ -209,53 +282,59 @@ def handle_start(translate: bool = False):
     threading.Thread(target=record_thread, args=(translate,), daemon=True).start()
 
 
-def handle_stop():
+def handle_stop() -> None:
     _stop_event.set()
-    try: os.remove(STATE_FILE)
-    except: pass
+    with suppress(FileNotFoundError):
+        STATE_FILE.unlink()
     print("⏹  Stop requested", flush=True)
 
 
-# ── Socket server ─────────────────────────────────────────────────
-def cleanup(sig=None, frame=None):
-    for p in (SOCKET_PATH, PID_FILE, STATE_FILE):
-        try: os.unlink(p)
-        except: pass
+def cleanup(sig=None, frame=None) -> None:  # noqa: ARG001 - signal handler signature
+    for path in (SOCKET_PATH, PID_FILE, STATE_FILE):
+        with suppress(FileNotFoundError):
+            path.unlink()
     sys.exit(0)
 
-signal.signal(signal.SIGTERM, cleanup)
-signal.signal(signal.SIGINT, cleanup)
 
-try: os.unlink(SOCKET_PATH)
-except: pass
+def serve() -> None:
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
 
-server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-server.bind(SOCKET_PATH)
-server.listen(5)
-os.chmod(SOCKET_PATH, 0o600)
+    with suppress(FileNotFoundError):
+        SOCKET_PATH.unlink()
 
-with open(PID_FILE, "w") as f:
-    f.write(str(os.getpid()))
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(SOCKET_PATH))
+    server.listen(5)
+    os.chmod(SOCKET_PATH, 0o600)
+    PID_FILE.write_text(str(os.getpid()))
 
-print(f"🟢 Daemon listening on {SOCKET_PATH}", flush=True)
-
-while True:
-    try:
-        conn, _ = server.accept()
+    print(f"🟢 Daemon listening on {SOCKET_PATH}", flush=True)
+    while True:
         try:
-            cmd = conn.recv(32).decode().strip()
-        finally:
-            conn.close()
-        print(f"CMD: {cmd}", flush=True)
-        if cmd == "start":
-            handle_start(translate=False)
-        elif cmd == "stop":
-            handle_stop()
-        elif cmd == "start_translate":
-            handle_start(translate=True)
-        elif cmd == "stop_translate":
-            handle_stop()
-        elif cmd == "quit":
-            cleanup()
-    except Exception as e:
-        print(f"Error: {e}", flush=True)
+            conn, _ = server.accept()
+            try:
+                cmd = conn.recv(32).decode().strip()
+            finally:
+                conn.close()
+            print(f"CMD: {cmd}", flush=True)
+            if cmd == "start":
+                handle_start(translate=False)
+            elif cmd == "stop":
+                handle_stop()
+            elif cmd == "start_translate":
+                handle_start(translate=True)
+            elif cmd == "stop_translate":
+                handle_stop()
+            elif cmd == "ping":
+                pass
+            elif cmd == "quit":
+                cleanup()
+            else:
+                print(f"⚠️  Unknown command: {cmd}", flush=True)
+        except Exception as exc:
+            print(f"Error: {exc}", flush=True)
+
+
+if __name__ == "__main__":
+    serve()

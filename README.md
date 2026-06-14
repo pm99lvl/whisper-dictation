@@ -1,51 +1,101 @@
 # whisper-dictation
 
-Free macOS voice dictation using [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon) + Hammerspoon.
+Local macOS voice dictation using [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper), Apple Silicon, and Hammerspoon.
 
-**Hold Left Alt** → speak → **release** → text is pasted into the active field.
+## Current workflow
 
-## How it works
+- **Hold Left Alt** → speak Russian → release → Russian text is pasted into the active field.
+- **Hold Right Alt** → speak Russian → release → text is transcribed in Russian, translated to English, and pasted into the active field.
 
-- `dictate_daemon.py` — persistent Python daemon that keeps the Whisper model loaded in RAM. Accepts `start` / `stop` commands over a Unix socket (`/tmp/whisper_daemon.sock`). After transcription writes the result to `/tmp/whisper_result.txt` and touches `/tmp/whisper_paste.trigger`.
-- `~/.hammerspoon/init.lua` — Hammerspoon config that handles the hotkey (Left Alt hold), watches for the trigger file, and pastes via `hs.eventtap.keyStroke({"cmd"}, "v")` (requires Accessibility permission).
+The active runtime path is:
+
+1. `dictate_daemon.py` keeps the Whisper model loaded in memory and accepts commands over `/tmp/whisper_daemon.sock`.
+2. `hammerspoon_init.lua` handles hotkeys, sends daemon commands, watches `/tmp/whisper_paste.trigger`, and pastes `/tmp/whisper_result.txt` into the saved active app.
+
+## Performance settings
+
+```python
+MODEL = "mlx-community/whisper-small-mlx"
+SILENCE_AFTER = 10.0
+MAX_SECONDS = 60
+```
+
+Why:
+
+- `whisper-small-mlx` is roughly 2× faster than `whisper-large-v3-turbo` on this setup.
+- `SILENCE_AFTER = 10.0` allows natural pauses during long dictation.
+- Releasing Alt still stops recording immediately, so the 10s timeout is only a safety fallback.
+
+## Screenshot-safe status alerts
+
+Hammerspoon status alerts are hidden before macOS screenshots (`Cmd+Shift+3/4/5`) and restored after 0.7s with the correct state (`dictating`, `transcribing`, `translate_dictating`, `translate_transcribing`).
 
 ## Requirements
 
-- macOS (Apple Silicon)
-- [Hammerspoon](https://www.hammerspoon.org/)
-- Python 3.11+ via pyenv (or any Python 3.11+)
-- `mlx-whisper`, `sounddevice`, `scipy`, `numpy`
+- macOS on Apple Silicon
+- Hammerspoon with Accessibility permission
+- Python 3.11+
+- Python packages: `mlx-whisper`, `sounddevice`, `scipy`, `numpy`, `deep-translator`
 
 ```bash
-pip install mlx-whisper sounddevice scipy numpy
+pip install mlx-whisper sounddevice scipy numpy deep-translator
 ```
 
 ## Setup
 
-1. Copy `dictate_daemon.py` to `~/.whisper-dictation/dictate_daemon.py`
-2. Copy `init.lua` to `~/.hammerspoon/init.lua`
-3. Grant Hammerspoon **Accessibility** permission in System Settings → Privacy & Security
-4. Reload Hammerspoon config
+```bash
+# daemon code
+mkdir -p ~/.whisper-dictation
+cp dictate_daemon.py ~/.whisper-dictation/dictate_daemon.py
 
-The daemon starts automatically when Hammerspoon loads. First start downloads the model (~1.5 GB, `mlx-community/whisper-large-v3-turbo`).
+# Hammerspoon config
+cp hammerspoon_init.lua ~/.hammerspoon/init.lua
+killall Hammerspoon && open -a Hammerspoon
+```
 
-## Voice punctuation commands (Russian)
+The daemon is started by Hammerspoon if `/tmp/whisper_daemon.sock` is not alive.
+
+## Debugging
+
+```bash
+# Check daemon process without stopping it
+ps -o pid,etime,%cpu,%mem,args -p $(pgrep -f dictate_daemon.py | head -1)
+
+# Watch logs
+tail -f /tmp/whisper_dictation.log
+
+# Check socket health
+echo ping | nc -U -w1 /tmp/whisper_daemon.sock
+
+# Compile-check Python files
+python3 -m py_compile dictate_daemon.py dictate.py dictate_standalone.py
+```
+
+Useful log markers:
+
+- `⏱ transcribe_ru: ...s` — local Whisper transcription time.
+- `⏱ translate_ru_en: ...s` — network translation time.
+- `⏱ handoff_to_hammerspoon: ...s` — file handoff time.
+- `Still transcribing — ignoring start` — a new start command arrived while previous transcription/translation was still running.
+
+## Voice punctuation commands
 
 | Say | Result |
-|-----|--------|
-| вопросительный знак | ? |
-| восклицательный знак | ! |
-| точка с запятой | ; |
-| двоеточие | : |
-| многоточие | … |
-| новая строка | ↵ |
-| новый абзац | ↵↵ |
+| --- | --- |
+| вопросительный знак | `?` |
+| восклицательный знак | `!` |
+| точка с запятой | `;` |
+| двоеточие | `:` |
+| многоточие | `…` |
+| новая строка | newline |
+| новый абзац | blank line |
 
-## Key settings in `dictate_daemon.py`
+## Legacy files
 
-```python
-MODEL            = "mlx-community/whisper-large-v3-turbo"
-SPEECH_THRESHOLD = 0.0008   # RMS threshold — tune for your mic
-SILENCE_AFTER    = 5.0      # seconds of silence before auto-stop
-MAX_SECONDS      = 300      # max recording length
-```
+These files are kept for history/backward compatibility, but are not the preferred runtime path:
+
+- `dictate.py` — older CLI `start|stop|toggle` flow.
+- `dictate_standalone.py` — older standalone event-monitor flow.
+- `WhisperDictation.app/` and `com.whisper-dictation.plist` — LaunchAgent/app wrapper for the standalone flow.
+
+Prefer `dictate_daemon.py` + Hammerspoon IPC for active development.

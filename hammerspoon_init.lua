@@ -1,21 +1,21 @@
--- Whisper Dictation — Left Alt (удержать) = RU, Right Alt (удержать) = EN перевод
+-- Whisper Dictation — Left Alt (hold) = RU, Right Alt (hold) = RU→EN
 
-local PYTHON        = "/Users/a1/.pyenv/versions/3.11.11/bin/python3"
-local DAEMON        = "/Users/a1/.whisper-dictation/dictate_daemon.py"
-local LOG           = "/tmp/whisper_dictation.log"
-local SOCKET        = "/tmp/whisper_daemon.sock"
-local PID_FILE      = "/tmp/whisper_daemon.pid"
-local STATE_FILE    = "/tmp/whisper_dictation_state"
-local RESULT_FILE   = "/tmp/whisper_result.txt"
-local TRIGGER_FILE  = "/tmp/whisper_paste.trigger"
-local FOCUS_FILE    = "/tmp/whisper_focus_app.txt"
-local LALT          = 58
+local PYTHON       = "/Users/a1/.pyenv/versions/3.11.11/bin/python3"
+local DAEMON       = "/Users/a1/.whisper-dictation/dictate_daemon.py"
+local LOG          = "/tmp/whisper_dictation.log"
+local SOCKET       = "/tmp/whisper_daemon.sock"
+local PID_FILE     = "/tmp/whisper_daemon.pid"
+local STATE_FILE   = "/tmp/whisper_dictation_state"
+local RESULT_FILE  = "/tmp/whisper_result.txt"
+local TRIGGER_FILE = "/tmp/whisper_paste.trigger"
+local FOCUS_FILE   = "/tmp/whisper_focus_app.txt"
+local LALT         = 58
+local RALT         = 61
 
 local styleRed = {
     fillColor={red=0,green=0,blue=0,alpha=0.88},
     strokeColor={red=1,green=0.2,blue=0.2,alpha=1},
-    strokeWidth=3, textColor={white=1,alpha=1},
-    textSize=22, radius=12,
+    strokeWidth=3, textColor={white=1,alpha=1}, textSize=22, radius=12,
     fadeInDuration=0.08, fadeOutDuration=0.25,
 }
 local styleGreen = hs.fnutils.copy(styleRed)
@@ -23,13 +23,22 @@ styleGreen.strokeColor = {red=0.2,green=0.85,blue=0.2,alpha=1}
 local styleGray = hs.fnutils.copy(styleRed)
 styleGray.strokeColor = {red=0.5,green=0.5,blue=0.5,alpha=1}
 
-local recAlertId     = nil
+local alertId = nil
+local alertType = nil -- dictating | transcribing | translate_dictating | translate_transcribing | nil
 local sessionStarted = false
-local LALT           = 58
-local RALT           = 61
+
+local function closeAlert()
+    if alertId then hs.alert.closeSpecific(alertId); alertId = nil end
+end
+
+local function showAlert(kind, text, style, seconds)
+    closeAlert()
+    alertType = kind
+    alertId = hs.alert.show(text, style, seconds)
+end
 
 local function sendCmd(cmd)
-    hs.execute("echo '" .. cmd .. "' | nc -U " .. SOCKET .. " 2>/dev/null")
+    hs.execute("printf '" .. cmd .. "' | nc -U " .. SOCKET .. " 2>/dev/null")
 end
 
 local function isRecording()
@@ -38,8 +47,8 @@ end
 
 local function isDaemonAlive()
     if not hs.fs.attributes(SOCKET) then return false end
-    local ok = hs.execute("echo 'ping' | nc -U -w1 " .. SOCKET .. " 2>/dev/null; echo $?")
-    return ok ~= nil
+    local rc = hs.execute("printf ping | nc -U -w1 " .. SOCKET .. " >/dev/null 2>&1; echo $?")
+    return rc and rc:match("^0") ~= nil
 end
 
 local function isDaemonProcessRunning()
@@ -75,8 +84,7 @@ local function startDaemon()
     end
     killOldDaemons()
     hs.alert.show("  ⏳  Загружаю модель Whisper...  ", styleGray, 9)
-    hs.execute("PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin " ..
-               PYTHON .. " " .. DAEMON .. " >> " .. LOG .. " 2>&1 &")
+    hs.execute("PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin " .. PYTHON .. " " .. DAEMON .. " >> " .. LOG .. " 2>&1 &")
     hs.timer.doAfter(9, function()
         if isDaemonAlive() then
             hs.alert.show("  🎙  Whisper готов!\n  Удержи Alt = запись  ", styleGreen, 3)
@@ -86,76 +94,71 @@ local function startDaemon()
     end)
 end
 
--- ── Общая функция начала/конца записи ─────────────────────────────
 local function saveFocusApp()
-    local focusApp = hs.application.frontmostApplication()
-    if focusApp then
-        local ff = io.open(FOCUS_FILE, "w")
-        if ff then ff:write(focusApp:name()); ff:close() end
+    local app = hs.application.frontmostApplication()
+    if app then
+        local f = io.open(FOCUS_FILE, "w")
+        if f then f:write(app:name()); f:close() end
     end
 end
 
--- ── Left Alt — диктовка на русском ────────────────────────────────
-whisperTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
-    if event:getKeyCode() ~= LALT then return false end
-    local flags = event:getFlags()
+local function activateSavedFocusApp()
+    local f = io.open(FOCUS_FILE, "r")
+    if not f then return end
+    local appName = f:read("*a"):match("^%s*(.-)%s*$")
+    f:close()
+    os.remove(FOCUS_FILE)
+    if not appName or appName == "" then return end
+    local app = hs.application.get(appName)
+    if app and (not hs.application.frontmostApplication() or hs.application.frontmostApplication():name() ~= appName) then
+        app:activate()
+        hs.timer.usleep(80000)
+    end
+end
 
+local function handleAlt(event, keyCode, startCmd, stopCmd, dictatingKind, transcribingKind, dictatingText, transcribingText)
+    if event:getKeyCode() ~= keyCode then return false end
+    local flags = event:getFlags()
     if flags.alt then
         sessionStarted = false
         if not isDaemonAlive() then startDaemon(); return false end
         saveFocusApp()
         hs.sound.getByName("Tink"):play()
-        recAlertId = hs.alert.show("  🎙  Диктую...  ", styleRed, 99)
-        sendCmd("start")
+        showAlert(dictatingKind, dictatingText, styleRed, 99)
+        sendCmd(startCmd)
         sessionStarted = true
     else
         if not sessionStarted then return false end
         sessionStarted = false
-        if recAlertId then hs.alert.closeSpecific(recAlertId); recAlertId = nil end
-        hs.alert.show("  ⚙️  Транскрибирую...  ", styleGreen, 4)
-        sendCmd("stop")
+        closeAlert()
+        showAlert(transcribingKind, transcribingText, styleGreen, 4)
+        sendCmd(stopCmd)
     end
     return false
+end
+
+whisperTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
+    return handleAlt(event, LALT, "start", "stop", "dictating", "transcribing", "  🎙  Диктую...  ", "  ⚙️  Транскрибирую...  ")
 end)
 whisperTap:start()
 
--- ── Right Alt — диктовка с переводом на английский ────────────────
 whisperTranslateTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
-    if event:getKeyCode() ~= RALT then return false end
-    local flags = event:getFlags()
-
-    if flags.alt then
-        sessionStarted = false
-        if not isDaemonAlive() then startDaemon(); return false end
-        saveFocusApp()
-        hs.sound.getByName("Tink"):play()
-        recAlertId = hs.alert.show("  🌐  Диктую → EN...  ", styleRed, 99)
-        sendCmd("start_translate")
-        sessionStarted = true
-    else
-        if not sessionStarted then return false end
-        sessionStarted = false
-        if recAlertId then hs.alert.closeSpecific(recAlertId); recAlertId = nil end
-        hs.alert.show("  ⚙️  Перевожу на EN...  ", styleGreen, 4)
-        sendCmd("stop_translate")
-    end
-    return false
+    return handleAlt(event, RALT, "start_translate", "stop_translate", "translate_dictating", "translate_transcribing", "  🌐  Диктую → EN...  ", "  ⚙️  Перевожу на EN...  ")
 end)
 whisperTranslateTap:start()
 
--- Авто-убирать алерт если запись завершилась по тишине
+-- Auto-hide only recording alerts. Do not kill transcribing/translation alerts early.
 hs.timer.new(0.5, function()
-    if recAlertId and not isRecording() then
-        hs.alert.closeSpecific(recAlertId)
-        recAlertId = nil
+    if alertId and (alertType == "dictating" or alertType == "translate_dictating") and not isRecording() then
+        closeAlert()
+        alertType = nil
     end
 end):start()
 
--- Watcher: демон написал результат → Hammerspoon вставляет
 whisperPasteWatcher = hs.pathwatcher.new("/private/tmp", function(paths)
     for _, p in ipairs(paths) do
         if p == TRIGGER_FILE or p == "/private/tmp/whisper_paste.trigger" then
-            hs.timer.doAfter(0.05, function()
+            hs.timer.doAfter(0.01, function()
                 if not hs.fs.attributes(TRIGGER_FILE) then return end
                 local f = io.open(RESULT_FILE, "r")
                 if not f then return end
@@ -165,18 +168,10 @@ whisperPasteWatcher = hs.pathwatcher.new("/private/tmp", function(paths)
                 os.remove(RESULT_FILE)
                 if text and #text > 0 then
                     hs.pasteboard.setContents(text)
-                    local ff = io.open(FOCUS_FILE, "r")
-                    if ff then
-                        local appName = ff:read("*a"):match("^%s*(.-)%s*$")
-                        ff:close()
-                        os.remove(FOCUS_FILE)
-                        if appName and appName ~= "" then
-                            local app = hs.application.get(appName)
-                            if app then app:activate() end
-                            hs.timer.usleep(150000)
-                        end
-                    end
-                    hs.eventtap.keyStroke({"cmd"}, "v")
+                    activateSavedFocusApp()
+                    -- keycode 9 = physical V key on ANSI keyboards; layout-independent Cmd+V.
+                    hs.eventtap.keyStroke({"cmd"}, 9)
+                    alertType = nil
                 end
             end)
         end
@@ -184,8 +179,27 @@ whisperPasteWatcher = hs.pathwatcher.new("/private/tmp", function(paths)
 end)
 whisperPasteWatcher:start()
 
--- Стартуем демон при загрузке Hammerspoon
-startDaemon()
+local screenshotKeys = {[20]=true, [21]=true, [23]=true} -- Cmd+Shift+3/4/5
+screenshotTap = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(event)
+    local flags = event:getFlags()
+    if not screenshotKeys[event:getKeyCode()] or not (flags.cmd and flags.shift) then return false end
+    local savedType = alertType
+    closeAlert()
+    hs.alert.closeAll()
+    hs.timer.doAfter(0.7, function()
+        if savedType == "dictating" and isRecording() then
+            showAlert("dictating", "  🎙  Диктую...  ", styleRed, 99)
+        elseif savedType == "translate_dictating" and isRecording() then
+            showAlert("translate_dictating", "  🌐  Диктую → EN...  ", styleRed, 99)
+        elseif savedType == "transcribing" then
+            showAlert("transcribing", "  ⚙️  Транскрибирую...  ", styleGreen, 4)
+        elseif savedType == "translate_transcribing" then
+            showAlert("translate_transcribing", "  ⚙️  Перевожу на EN...  ", styleGreen, 4)
+        end
+    end)
+    return false
+end)
+screenshotTap:start()
 
--- Enable IPC для диагностики
+startDaemon()
 require("hs.ipc")

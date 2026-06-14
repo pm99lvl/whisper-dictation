@@ -19,21 +19,25 @@ PID_FILE = "/tmp/whisper_daemon.pid"
 with open(PID_FILE, "w") as f:
     f.write(str(os.getpid()))
 
-MODEL            = "mlx-community/whisper-large-v3-turbo"
+MODEL            = "mlx-community/whisper-small-mlx"
 SAMPLE_RATE      = 16000
-MAX_SECONDS      = 300
+MAX_SECONDS      = 60
 SPEECH_THRESHOLD = 0.0008
-SILENCE_AFTER    = 5.0
+SILENCE_AFTER    = 10.0
 MIN_RECORD_TIME  = 1.0
 
 # ── Загружаем модель один раз ──────────────────────────────────────
 print("⏳ Loading model...", flush=True)
 import mlx_whisper
 
-_warmup = tempfile.mktemp(suffix=".wav")
-wf.write(_warmup, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
-mlx_whisper.transcribe(_warmup, path_or_hf_repo=MODEL, language=None, word_timestamps=False)
-os.unlink(_warmup)
+_warmup = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+_warmup.close()
+try:
+    wf.write(_warmup.name, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
+    mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language=None, word_timestamps=False)
+finally:
+    try: os.unlink(_warmup.name)
+    except FileNotFoundError: pass
 print("✅ Model ready. Hold Left Alt to dictate.", flush=True)
 
 # ── Состояние ─────────────────────────────────────────────────────
@@ -125,12 +129,13 @@ def apply_punct_commands(text):
 
 # ── Транскрипция + вставка ────────────────────────────────────────
 def transcribe_and_paste(audio, focus_app):
-    tmp = tempfile.mktemp(suffix=".wav")
-    wf.write(tmp, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    wf.write(tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
     try:
         print("⚙️  Transcribing...", flush=True)
         result = mlx_whisper.transcribe(
-            tmp, path_or_hf_repo=MODEL, language=None, word_timestamps=False,
+            tmp.name, path_or_hf_repo=MODEL, language=None, word_timestamps=False,
             condition_on_previous_text=False)
         text = result["text"].strip()
         if not text:
@@ -149,8 +154,8 @@ def transcribe_and_paste(audio, focus_app):
             time.sleep(0.15)
         paste_via_quartz()
     finally:
-        try: os.unlink(tmp)
-        except: pass
+        try: os.unlink(tmp.name)
+        except FileNotFoundError: pass
 
 
 # ── Запись ────────────────────────────────────────────────────────
