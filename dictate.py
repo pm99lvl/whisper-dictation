@@ -16,11 +16,11 @@ import scipy.io.wavfile as wavfile
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
 # ── Настройки ──────────────────────────────────────────────────────────────
-MODEL             = "mlx-community/whisper-large-v3-turbo"
+MODEL             = "mlx-community/whisper-small-mlx"
 SAMPLE_RATE       = 16000
 MAX_SECONDS       = 60
 SPEECH_THRESHOLD  = 0.005   # RMS выше этого = речь
-SILENCE_AFTER     = 2.5     # секунды тишины после речи → авто-стоп
+SILENCE_AFTER     = 10.0    # длинные паузы; отпускание Alt всё равно стопает мгновенно
 MIN_RECORD_TIME   = 1.5     # минимальное время записи (не стопать раньше)
 
 STATE_FILE = "/tmp/whisper_dictation_state"

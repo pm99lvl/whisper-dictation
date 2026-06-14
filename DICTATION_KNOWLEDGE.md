@@ -1,0 +1,145 @@
+---
+tags:
+  - dictation
+  - whisper
+  - hammerspoon
+  - automation
+  - optimization
+created: 2026-06-10
+updated: 2026-06-10
+---
+
+# 🎙 Whisper Dictation Project Knowledge Base
+
+Полная документация по архитектуре, настройкам и оптимизациям локальной системы голосовой диктовки и перевода на macOS (Apple Silicon).
+
+## 🏗 Архитектура системы
+
+Система состоит из двух основных компонентов, общающихся через Unix-сокет:
+
+1. **Python Daemon (`~/.whisper-dictation/dictate_daemon.py`)**
+   - Держит модель Whisper в памяти (без перезагрузки при каждой диктовке).
+   - Слушает команды `start`, `stop`, `start_translate`, `stop_translate` через сокет `/tmp/whisper_daemon.sock`.
+   - Записывает аудио с микрофона (16kHz), детектирует речь и тишину.
+   - Выполняет транскрипцию и (опционально) перевод через `deep_translator`.
+   - Сохраняет результат в `/tmp/whisper_result.txt` и создаёт триггер `/tmp/whisper_paste.trigger`.
+   - Запись и обработка разделены: можно начать следующую запись, пока предыдущая транскрипция/перевод ещё выполняется; готовые аудио-задачи идут через одну очередь обработки.
+
+2. **Hammerspoon (`~/.hammerspoon/init.lua`)**
+   - Перехватывает удержание клавиш: **Left Alt** (диктовка RU), **Right Alt** (диктовка + перевод EN).
+   - Отправляет команды демону через `nc -U`.
+   - Отслеживает появление триггерного файла и выполняет вставку текста через буфер обмена + эмуляцию `Cmd+V` (keycode 9, работает независимо от раскладки клавиатуры).
+   - Управляет визуальными оверлеями (статусы записи/транскрипции).
+
+## 🚀 Оптимизации скорости (Branch: `feature/speed-optimization`)
+
+Чтобы ускорить процесс диктовки и перевода в ~2.5–3 раза, были применены следующие изменения:
+
+| Параметр | Было | Стало | Эффект |
+| :--- | :--- | :--- | :--- |
+| **Модель Whisper** | `mlx-community/whisper-large-v3-turbo` | `mlx-community/whisper-small-mlx` | Транскрипция стала ~в 2 раза быстрее (с ~4.5с до ~2.3с на 5с аудио). |
+| **Порог тишины** (`SILENCE_AFTER`) | `5.0` секунд | `10.0` секунд | Позволяет делать естественные паузы для размышлений во время длинной диктовки. Запись прерывается мгновенно при *отпускании* клавиши Alt. |
+| **Перевод** | `GoogleTranslator` (同步) | `GoogleTranslator` (синхронно) | Добавляет ~0.6с. Это сетевой вызов, дальнейшая локальная оптимизация невозможна без смены провайдера API. |
+
+> [!IMPORTANT] Как пользоваться длинными текстами
+> Удерживайте Alt, делайте паузы (до 10 секунд). Если нужно завершить фразу или предложение раньше — просто **отпустите клавишу Alt**. Демон мгновенно начнет обработку.
+
+## 📸 Скрытие UI-элементов на скриншотах
+
+Чтобы служебные плашки не попадали на снимки экрана (`Cmd+Shift+3/4/5`), в Hammerspoon реализован перехват:
+
+```lua
+-- При нажатии Cmd+Shift+3/4/5:
+local savedAlertType = _currentAlertType
+hs.alert.closeAll() -- Мгновенно скрывает все плашки
+
+-- Через 0.7 секунды (после завершения захвата macOS) восстанавливает нужную плашку:
+hs.timer.doAfter(0.7, function()
+    if savedAlertType == "dictating" then
+        hs.alert.show("  🎙  Диктую...  ", styleRed, 99)
+    -- ... и так далее для transcribing / translate modes
+end)
+```
+
+## 🧠 Умные функции демона
+
+1. **Голосовая пунктуация**: Распознает команды и заменяет их на символы:
+   - "вопросительный знак" → `?`
+   - "восклицательный знак" → `!`
+   - "новая строка" → `\n`
+   - "новый абзац" → `\n\n`
+2. **Детектор галлюцинаций**: Если >80% слов в распознанном тексте одинаковые (зацикливание модели), текст отбрасывается.
+3. **Fallback микрофона**: Автоматически выбирает встроенный микрофон MacBook, если доступно несколько устройств.
+4. **Защита от зависания**: `MAX_SECONDS = 60` принудительно обрывает запись, если клавиша "залипла".
+
+## 📁 Ключевые файлы и пути
+
+| Файл / Путь | Описание |
+| :--- | :--- |
+| `~/.whisper-dictation/dictate_daemon.py` | Основной код демона (Python). |
+| `~/.hammerspoon/init.lua` | Конфигурация Hammerspoon (Lua). |
+| `/tmp/whisper_dictation.log` | Лог демона (ошибки, статусы, распознанный текст). |
+| `/tmp/whisper_daemon.sock` | Unix-сокет для IPC. |
+| `/tmp/whisper_result.txt` | Временный файл с результатом транскрипции. |
+| `/tmp/whisper_paste.trigger` | Файл-триггер для Hammerspoon. |
+
+## 🛠 Полезные команды для отладки
+
+```bash
+# Перезапуск демона
+kill $(pgrep -f dictate_daemon.py) && PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin ~/.pyenv/versions/3.11.11/bin/python3 ~/.whisper-dictation/dictate_daemon.py >> /tmp/whisper_dictation.log 2>&1 &
+
+# Проверка статуса
+tail -f /tmp/whisper_dictation.log
+
+# Тест IPC сокета
+echo 'ping' | nc -U -w1 /tmp/whisper_daemon.sock
+
+# Перезагрузка Hammerspoon
+killall Hammerspoon && open -a Hammerspoon
+```
+
+### Маркеры производительности в логах
+
+Актуальный демон пишет тайминги для поиска узких мест:
+
+- `⏱ transcribe_ru: ...s` — время локальной русской транскрипции.
+- `⏱ translate_ru_en: ...s` — время сетевого перевода RU→EN.
+- `⏱ transcribe: ...s` — время обычной диктовки без перевода.
+- `⏱ handoff_to_hammerspoon: ...s` — время атомарной передачи результата Hammerspoon.
+- `📥 Queued transcription ...` — запись завершилась и поставлена в очередь обработки.
+- `Still transcribing — recording next phrase concurrently` — новая запись началась параллельно с обработкой предыдущей; старт больше не теряется.
+- `Still transcribing — ignoring start` — старый проблемный маркер; если снова появился, значит новая запись снова теряется и это регрессия.
+
+### Resiliency runtime
+
+Подробный эксплуатационный playbook: [[RESILIENCY_GUIDE]] / `RESILIENCY_GUIDE.md`.
+
+В ветке `feature/resilient-runtime` добавлены:
+
+- `dictation_runtime.py` — тестируемые хелперы для session_id, state snapshot, atomic JSON write, stale-file cleanup, process liveness.
+- `test_runtime.py` — unittest-покрытие runtime-хелперов без внешних зависимостей.
+- Single-instance guard: второй демон выходит до загрузки модели, если PID-файл указывает на живой процесс.
+- Startup cleanup: stale socket/state/result/trigger удаляются при старте, если живого демона нет.
+- Socket-команда `status`, возвращающая JSON runtime-состояния.
+- `/tmp/whisper_status.json` — persisted status snapshot для watchdog/Hammerspoon.
+- Structured events в логах: `🧾 event=... session_id=... state=... queue_size=...`.
+
+Проверка:
+
+```bash
+printf ping | nc -U -w1 /tmp/whisper_daemon.sock
+printf status | nc -U -w1 /tmp/whisper_daemon.sock | python3 -m json.tool
+python3 -m json.tool /tmp/whisper_status.json
+```
+
+## 📝 История изменений (Changelog)
+
+- **2026-06-14**: Resiliency runtime: session_id/state/status JSON, single-instance guard, startup cleanup stale-файлов, structured event logs, unittest для runtime-хелперов.
+- **2026-06-10**: Аудит/cleanup: безопасные temp-файлы вместо `mktemp`, атомарная передача результата Hammerspoon, кэширование переводчика и микрофона, тайминги транскрипции/перевода/передачи, синхронизация legacy-файлов с актуальной моделью и timeout.
+- **2026-06-10**: Увеличен `SILENCE_AFTER` до 10.0с для поддержки длинных текстов с паузами. Сменена модель на `whisper-small-mlx`. Реализован хук скрытия алертов при скриншотах. (Commit: `86f7870`)
+- **2026-06-08**: Исправлена вставка текста на русской раскладке (использование keycode 9 вместо символа 'v'). Заменены `hs.canvas` оверлеи на `hs.alert` с перехватом скриншотов.
+- **2026-05-26**: Initial setup: standalone daemon, app bundle, LaunchAgent, hold-Alt hotkey.
+
+---
+*Этот файл предназначен для хранения в Obsidian и быстрого доступа к контексту проекта диктовки.*
