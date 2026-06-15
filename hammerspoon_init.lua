@@ -3,6 +3,7 @@
 local PYTHON       = "/Users/a1/.pyenv/versions/3.11.11/bin/python3"
 local DAEMON       = "/Users/a1/.whisper-dictation/dictate_daemon.py"
 local LOG          = "/tmp/whisper_dictation.log"
+local HS_LOG       = "/tmp/whisper_hammerspoon.log"
 local SOCKET       = "/tmp/whisper_daemon.sock"
 local PID_FILE     = "/tmp/whisper_daemon.pid"
 local STATE_FILE   = "/tmp/whisper_dictation_state"
@@ -26,6 +27,13 @@ styleGray.strokeColor = {red=0.5,green=0.5,blue=0.5,alpha=1}
 local alertId = nil
 local alertType = nil -- dictating | transcribing | translate_dictating | translate_transcribing | nil
 local sessionStarted = false
+
+local function hsLog(message)
+    local f = io.open(HS_LOG, "a")
+    if not f then return end
+    f:write(string.format("%.3f %s\n", hs.timer.secondsSinceEpoch(), message))
+    f:close()
+end
 
 local function closeAlert()
     if alertId then hs.alert.closeSpecific(alertId); alertId = nil end
@@ -162,19 +170,39 @@ end):start()
 whisperPasteWatcher = hs.pathwatcher.new("/private/tmp", function(paths)
     for _, p in ipairs(paths) do
         if p == TRIGGER_FILE or p == "/private/tmp/whisper_paste.trigger" then
+            local seenAt = hs.timer.secondsSinceEpoch()
+            hsLog("paste_trigger_seen path=" .. p)
             hs.timer.doAfter(0.01, function()
-                if not hs.fs.attributes(TRIGGER_FILE) then return end
+                if not hs.fs.attributes(TRIGGER_FILE) then
+                    hsLog("paste_trigger_missing")
+                    return
+                end
                 local f = io.open(RESULT_FILE, "r")
-                if not f then return end
+                if not f then
+                    hsLog("paste_result_missing")
+                    return
+                end
                 local text = f:read("*a")
                 f:close()
                 os.remove(TRIGGER_FILE)
                 os.remove(RESULT_FILE)
                 if text and #text > 0 then
+                    local readAt = hs.timer.secondsSinceEpoch()
                     hs.pasteboard.setContents(text)
                     activateSavedFocusApp()
+                    local focusAt = hs.timer.secondsSinceEpoch()
                     -- keycode 9 = physical V key on ANSI keyboards; layout-independent Cmd+V.
                     hs.eventtap.keyStroke({"cmd"}, 9)
+                    local pasteAt = hs.timer.secondsSinceEpoch()
+                    hsLog(string.format(
+                        "paste_sent chars=%d trigger_to_read=%.3fs read_to_focus=%.3fs focus_to_paste=%.3fs total=%.3fs frontmost=%s",
+                        #text,
+                        readAt - seenAt,
+                        focusAt - readAt,
+                        pasteAt - focusAt,
+                        pasteAt - seenAt,
+                        hs.application.frontmostApplication() and hs.application.frontmostApplication():name() or "nil"
+                    ))
                     alertType = nil
                 end
             end)
@@ -206,7 +234,7 @@ end)
 screenshotTap:start()
 
 -- Watchdog: keep daemon alive and refresh status snapshot without touching active recordings.
-daemonWatchdog = hs.timer.new(15, function()
+daemonWatchdog = hs.timer.new(60, function()
     if not isDaemonAlive() and not isDaemonProcessRunning() then
         hs.alert.show("  ⚠️  Whisper демон умер — перезапускаю...  ", styleGray, 3)
         startDaemon()
