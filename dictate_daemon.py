@@ -36,7 +36,7 @@ SILENCE_AFTER = 10.0      # allows natural pauses; release Alt for instant stop
 MIN_RECORD_TIME = 1.0
 BLOCK_SECONDS = 0.1
 EDGE_SILENCE_KEEP_SECONDS = 0.2
-INNER_SILENCE_KEEP_SECONDS = 0.6
+INNER_SILENCE_KEEP_SECONDS = 0.35
 
 SOCKET_PATH = Path("/tmp/whisper_daemon.sock")
 STATE_FILE = Path("/tmp/whisper_dictation_state")
@@ -230,7 +230,7 @@ def compact_silence(audio: np.ndarray) -> np.ndarray:
     # actual speech from constant background noise.
     noise_floor = float(np.percentile(rms_values, 20))
     peak = float(np.max(rms_values))
-    dynamic_threshold = max(SPEECH_THRESHOLD * 3.0, noise_floor * 3.5, peak * 0.08)
+    dynamic_threshold = max(SPEECH_THRESHOLD * 4.0, noise_floor * 5.0, peak * 0.18)
     speech_indexes = [i for i, rms in enumerate(rms_values) if rms >= dynamic_threshold]
     if not speech_indexes:
         print(
