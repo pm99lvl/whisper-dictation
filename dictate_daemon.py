@@ -216,9 +216,28 @@ def compact_silence(audio: np.ndarray) -> np.ndarray:
         return audio
 
     chunks = [audio[i : i + chunk_size] for i in range(0, len(audio), chunk_size)]
-    rms_values = [float(np.sqrt(np.mean(chunk**2))) if len(chunk) else 0.0 for chunk in chunks]
-    speech_indexes = [i for i, rms in enumerate(rms_values) if rms >= SPEECH_THRESHOLD]
+    rms_values = np.array(
+        [float(np.sqrt(np.mean(chunk**2))) if len(chunk) else 0.0 for chunk in chunks],
+        dtype=np.float32,
+    )
+    if len(rms_values) == 0:
+        return audio
+
+    # The fixed SPEECH_THRESHOLD is intentionally sensitive while recording, but
+    # it is too low for post-processing on a busy desk: background fan/room noise
+    # can mark the entire recording as speech, so Whisper receives 20s+ of audio.
+    # Use the current recording's own noise floor and peak level to separate
+    # actual speech from constant background noise.
+    noise_floor = float(np.percentile(rms_values, 20))
+    peak = float(np.max(rms_values))
+    dynamic_threshold = max(SPEECH_THRESHOLD * 3.0, noise_floor * 3.5, peak * 0.08)
+    speech_indexes = [i for i, rms in enumerate(rms_values) if rms >= dynamic_threshold]
     if not speech_indexes:
+        print(
+            f"✂️  audio_compact: no speech by dynamic threshold "
+            f"(noise={noise_floor:.5f}, peak={peak:.5f}, threshold={dynamic_threshold:.5f})",
+            flush=True,
+        )
         return audio
 
     edge_keep = max(1, int(EDGE_SILENCE_KEEP_SECONDS / BLOCK_SECONDS))
@@ -232,7 +251,7 @@ def compact_silence(audio: np.ndarray) -> np.ndarray:
 
     for idx in range(first_speech, last_speech + 1):
         chunk = chunks[idx]
-        if rms_values[idx] >= SPEECH_THRESHOLD:
+        if rms_values[idx] >= dynamic_threshold:
             if silence_run:
                 kept.extend(silence_run[:inner_keep])
                 silence_run = []
@@ -250,9 +269,17 @@ def compact_silence(audio: np.ndarray) -> np.ndarray:
     original_s = len(audio) / SAMPLE_RATE
     compacted_s = len(compacted) / SAMPLE_RATE
     if original_s - compacted_s >= 0.2:
-        print(f"✂️  audio_compact: {original_s:.2f}s → {compacted_s:.2f}s", flush=True)
+        print(
+            f"✂️  audio_compact: {original_s:.2f}s → {compacted_s:.2f}s "
+            f"(noise={noise_floor:.5f}, peak={peak:.5f}, threshold={dynamic_threshold:.5f})",
+            flush=True,
+        )
     else:
-        print(f"✂️  audio_compact: {original_s:.2f}s unchanged", flush=True)
+        print(
+            f"✂️  audio_compact: {original_s:.2f}s unchanged "
+            f"(noise={noise_floor:.5f}, peak={peak:.5f}, threshold={dynamic_threshold:.5f})",
+            flush=True,
+        )
     return compacted
 
 
