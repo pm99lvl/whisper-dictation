@@ -16,14 +16,14 @@ The active runtime path is:
 
 ```python
 MODEL = "mlx-community/whisper-small-mlx"
-SILENCE_AFTER = 10.0
+SILENCE_AFTER = 2.0
 MAX_SECONDS = 60
 ```
 
 Why:
 
 - `whisper-small-mlx` is roughly 2× faster than `whisper-large-v3-turbo` on this setup.
-- `SILENCE_AFTER = 10.0` allows natural pauses during long dictation.
+- `SILENCE_AFTER = 2.0` makes recording stop sooner after speech ends, so the next dictation starts faster.
 - Releasing Alt still stops recording immediately, so the 10s timeout is only a safety fallback.
 
 ## Screenshot-safe status alerts

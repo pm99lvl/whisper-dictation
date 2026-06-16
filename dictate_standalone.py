@@ -23,7 +23,7 @@ MODEL            = "mlx-community/whisper-small-mlx"
 SAMPLE_RATE      = 16000
 MAX_SECONDS      = 60
 SPEECH_THRESHOLD = 0.0008
-SILENCE_AFTER    = 10.0
+SILENCE_AFTER    = 2.0
 MIN_RECORD_TIME  = 1.0
 
 # ── Загружаем модель один раз ──────────────────────────────────────
