@@ -12,19 +12,47 @@ The active runtime path is:
 1. `dictate_daemon.py` keeps the Whisper model loaded in memory and accepts commands over `/tmp/whisper_daemon.sock`. Recording and transcription are decoupled: new audio can be recorded while the previous phrase is still being transcribed/translated, and jobs are processed through a single transcription queue.
 2. `hammerspoon_init.lua` handles hotkeys, sends daemon commands, watches `/tmp/whisper_paste.trigger`, and pastes `/tmp/whisper_result.txt` into the saved active app.
 
-## Performance settings
+## Local UI
+
+Run this from the project root to open the localhost control panel:
+
+```bash
+python3 dictation_ui.py
+```
+
+The panel lives at `http://127.0.0.1:8787` and lets you switch between:
+
+- `Fast` - smaller model, quicker turnaround, lower quality.
+- `Quality` - larger model, slower turnaround, better Russian recognition.
+
+Changing the mode writes `~/.whisper-dictation/dictation_mode.json` and restarts the daemon with that preset.
+
+## Quality mode
+
+This checkout now defaults to a quality-first preset:
 
 ```python
-MODEL = "mlx-community/whisper-small-mlx"
-SILENCE_AFTER = 2.0
-MAX_SECONDS = 60
+MODEL = "mlx-community/whisper-large-v3-turbo"
+SILENCE_AFTER = 6.0
+MAX_SECONDS = 90
 ```
 
 Why:
 
-- `whisper-small-mlx` is roughly 2× faster than `whisper-large-v3-turbo` on this setup.
-- `SILENCE_AFTER = 2.0` makes recording stop sooner after speech ends, so the next dictation starts faster.
-- Releasing Alt still stops recording immediately, so the 10s timeout is only a safety fallback.
+- `whisper-large-v3-turbo` should give noticeably better Russian recognition than `whisper-small-mlx`, while staying more practical than the full `large-v3-mlx` model.
+- `SILENCE_AFTER = 6.0` leaves more room for natural pauses, which helps long phrases stay intact.
+- `MAX_SECONDS = 90` gives long dictation sessions more room before the safety cutoff.
+- Releasing Alt still stops recording immediately, so the timeout remains a fallback.
+
+You can still override the preset with env vars if you want to trade quality back for speed:
+
+```bash
+export WHISPER_MODEL=mlx-community/whisper-small-mlx
+export WHISPER_SILENCE_AFTER=2
+export WHISPER_MAX_SECONDS=45
+```
+
+If you want to try an even faster model later, you can point `WHISPER_MODEL` at a `tiny` or `small` variant, but expect a noticeable quality drop and a shorter first-download time.
 
 ## Screenshot-safe status alerts
 

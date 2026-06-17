@@ -11,16 +11,18 @@ import subprocess
 import numpy as np
 import sounddevice as sd
 import scipy.io.wavfile as wavfile
+from dictation_modes import get_active_preset
 
 # Прописываем PATH чтобы ffmpeg находился из Homebrew
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
 # ── Настройки ──────────────────────────────────────────────────────────────
-MODEL             = "mlx-community/whisper-small-mlx"
+ACTIVE_MODE, ACTIVE_PRESET = get_active_preset()
+MODEL             = os.getenv("WHISPER_MODEL", ACTIVE_PRESET["model"])
 SAMPLE_RATE       = 16000
-MAX_SECONDS       = 60
+MAX_SECONDS       = int(os.getenv("WHISPER_MAX_SECONDS", str(ACTIVE_PRESET["max_seconds"])))
 SPEECH_THRESHOLD  = 0.005   # RMS выше этого = речь
-SILENCE_AFTER     = 2.0     # короткая пауза для более быстрого старта диктовки
+SILENCE_AFTER     = float(os.getenv("WHISPER_SILENCE_AFTER", str(ACTIVE_PRESET["silence_after"])))
 MIN_RECORD_TIME   = 1.5     # минимальное время записи (не стопать раньше)
 
 STATE_FILE = "/tmp/whisper_dictation_state"

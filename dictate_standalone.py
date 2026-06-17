@@ -12,18 +12,20 @@ import sys, os, threading, tempfile, time, signal, subprocess, re
 import numpy as np
 import sounddevice as sd
 import scipy.io.wavfile as wf
+from dictation_modes import get_active_preset
 
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
-PID_FILE = "/tmp/whisper_daemon.pid"
+PID_FILE = "/tmp/whisper_standalone.pid"
 with open(PID_FILE, "w") as f:
     f.write(str(os.getpid()))
 
-MODEL            = "mlx-community/whisper-small-mlx"
+ACTIVE_MODE, ACTIVE_PRESET = get_active_preset()
+MODEL            = os.getenv("WHISPER_MODEL", ACTIVE_PRESET["model"])
 SAMPLE_RATE      = 16000
-MAX_SECONDS      = 60
+MAX_SECONDS      = int(os.getenv("WHISPER_MAX_SECONDS", str(ACTIVE_PRESET["max_seconds"])))
 SPEECH_THRESHOLD = 0.0008
-SILENCE_AFTER    = 2.0
+SILENCE_AFTER    = float(os.getenv("WHISPER_SILENCE_AFTER", str(ACTIVE_PRESET["silence_after"])))
 MIN_RECORD_TIME  = 1.0
 
 # ── Загружаем модель один раз ──────────────────────────────────────
@@ -34,7 +36,7 @@ _warmup = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
 _warmup.close()
 try:
     wf.write(_warmup.name, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
-    mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language=None, word_timestamps=False)
+    mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language="ru", word_timestamps=False, temperature=0)
 finally:
     try: os.unlink(_warmup.name)
     except FileNotFoundError: pass
@@ -135,8 +137,12 @@ def transcribe_and_paste(audio, focus_app):
     try:
         print("⚙️  Transcribing...", flush=True)
         result = mlx_whisper.transcribe(
-            tmp.name, path_or_hf_repo=MODEL, language=None, word_timestamps=False,
-            condition_on_previous_text=False)
+            tmp.name,
+            path_or_hf_repo=MODEL,
+            language="ru",
+            word_timestamps=False,
+            condition_on_previous_text=False,
+            temperature=0)
         text = result["text"].strip()
         if not text:
             notify("Whisper", "Текст не распознан")

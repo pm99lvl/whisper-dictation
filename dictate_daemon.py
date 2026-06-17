@@ -24,15 +24,18 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+from dictation_modes import get_active_preset
 from dictation_runtime import RuntimeState, cleanup_stale_files, is_process_alive, write_json_atomic
 
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
-MODEL = "mlx-community/whisper-small-mlx"
+ACTIVE_MODE, ACTIVE_PRESET = get_active_preset()
+MODEL = os.getenv("WHISPER_MODEL", ACTIVE_PRESET["model"])
 SAMPLE_RATE = 16000
-MAX_SECONDS = 60          # safety guard for a stuck hotkey
+MAX_SECONDS = int(os.getenv("WHISPER_MAX_SECONDS", str(ACTIVE_PRESET["max_seconds"])))
 SPEECH_THRESHOLD = 0.0008
-SILENCE_AFTER = 2.0       # shorter auto-stop keeps dictation snappier
+SPEECH_PEAK_FLOOR = 0.01   # below this peak the audio is room noise → skip Whisper
+SILENCE_AFTER = float(os.getenv("WHISPER_SILENCE_AFTER", str(ACTIVE_PRESET["silence_after"])))
 MIN_RECORD_TIME = 1.0
 BLOCK_SECONDS = 0.1
 EDGE_SILENCE_KEEP_SECONDS = 0.2
@@ -77,7 +80,7 @@ _warmup = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
 _warmup.close()
 try:
     wf.write(_warmup.name, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
-    mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language=None, word_timestamps=False)
+    mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language="ru", word_timestamps=False, temperature=0)
 finally:
     with suppress(FileNotFoundError):
         os.unlink(_warmup.name)
@@ -133,6 +136,8 @@ def status_payload() -> dict:
             "ok": True,
             "pid": os.getpid(),
             "model": MODEL,
+            "preset_mode": ACTIVE_MODE,
+            "preset_name": ACTIVE_PRESET["name"],
             "recording": _recording,
             "transcribing": _transcribing,
             "queue_size": _transcription_queue.qsize(),
@@ -164,6 +169,32 @@ def get_translator() -> GoogleTranslator:
     return _translator_ru_en
 
 
+TRANSLATE_TIMEOUT = 8.0  # GoogleTranslator has no timeout; a dead network must not freeze the worker
+
+
+def translate_with_timeout(text: str) -> str:
+    """Run the network translate with a hard timeout.
+
+    deep_translator's GoogleTranslator issues a requests call with no timeout, so
+    when translate.google.com is unreachable the call blocks forever — and because
+    a single worker thread drains the queue, it froze ALL dictation (not just
+    translate). Run it in a throwaway thread and abandon it on timeout; the caller
+    falls back to the RU text so nothing is lost and the queue keeps moving.
+    """
+    result: dict[str, str] = {}
+
+    def _run() -> None:
+        with suppress(Exception):
+            result["text"] = get_translator().translate(text)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(TRANSLATE_TIMEOUT)
+    if worker.is_alive() or "text" not in result or not result["text"]:
+        raise TimeoutError(f"translate unavailable after {TRANSLATE_TIMEOUT}s")
+    return result["text"]
+
+
 def find_input_device() -> tuple[int | None, str | None]:
     """Prefer the built-in MacBook microphone; cache result for subsequent recordings."""
     global _input_device, _input_device_name
@@ -192,6 +223,49 @@ def apply_punct_commands(text: str) -> str:
 def is_hallucination_loop(text: str) -> bool:
     words = text.split()
     return len(words) > 10 and len(set(words)) / len(words) < 0.2
+
+
+# Whisper invents these subtitle-style phrases when fed near-silence. They pass
+# is_hallucination_loop (no repetition) and the model reports high confidence
+# (no_speech_prob≈0, avg_logprob≈-0.1), so the only reliable signal is the text.
+HALLUCINATION_PHRASES = [
+    "продолжение следует",
+    "продолжение в следующей серии",
+    "субтитры сделал",
+    "субтитры создавал",
+    "субтитры добавил",
+    "субтитры подготовил",
+    "редактор субтитров",
+    "корректор",
+    "dimatorzok",
+    "amara.org",
+    "спасибо за просмотр",
+    "спасибо за внимание",
+    "подписывайтесь на канал",
+    "ставьте лайки",
+]
+_HALLUCINATION_NORM_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def is_hallucination_phrase(text: str) -> bool:
+    """True for known silence artifacts that dominate a short output.
+
+    Limited to <=6 words so a real sentence that merely contains one of these
+    words (e.g. "субтитры надо вынести в модуль") is not discarded.
+    """
+    norm = _HALLUCINATION_NORM_RE.sub(" ", text.lower()).strip()
+    if not norm or len(norm.split()) > 6:
+        return False
+    return any(phrase in norm for phrase in HALLUCINATION_PHRASES)
+
+
+def has_real_speech(audio: np.ndarray) -> bool:
+    """Peak-amplitude gate. The hallucination bug fed Whisper audio peaking at
+    ~0.0015 (background room noise). Real speech peaks well above SPEECH_PEAK_FLOOR,
+    so gating here both stops the artifact and skips a 20-30s pointless transcription."""
+    if len(audio) == 0:
+        return False
+    return float(np.max(np.abs(audio))) >= SPEECH_PEAK_FLOOR
 
 
 def write_result_for_hammerspoon(text: str) -> None:
@@ -230,7 +304,12 @@ def compact_silence(audio: np.ndarray) -> np.ndarray:
     # actual speech from constant background noise.
     noise_floor = float(np.percentile(rms_values, 20))
     peak = float(np.max(rms_values))
-    dynamic_threshold = max(SPEECH_THRESHOLD * 5.0, noise_floor * 8.0, peak * 0.28)
+    # Place the cut inside the recording's own dynamic range (between noise floor
+    # and peak) instead of using an absolute multiple of the noise floor. With a
+    # quiet mic noise_floor*8 can exceed the speech peak (noise=0.0054, peak=0.027 →
+    # threshold 0.043 > peak), so compaction bailed and Whisper chewed 17s of
+    # uncompacted silence. A range-relative cut scales with both loud and quiet takes.
+    dynamic_threshold = max(SPEECH_THRESHOLD * 2.0, noise_floor + (peak - noise_floor) * 0.18)
     speech_indexes = [i for i, rms in enumerate(rms_values) if rms >= dynamic_threshold]
     if not speech_indexes:
         print(
@@ -268,6 +347,11 @@ def compact_silence(audio: np.ndarray) -> np.ndarray:
     compacted = np.concatenate(kept).flatten() if kept else audio
     original_s = len(audio) / SAMPLE_RATE
     compacted_s = len(compacted) / SAMPLE_RATE
+    # NB: no "too aggressive" relative guard here. A short phrase held under a
+    # multi-second Alt press is legitimately >50% silence; reverting that cut just
+    # forced Whisper to chew the full take (the 17s "Раз, два, три" case). The
+    # algorithm already preserves every speech chunk plus padding, so trimming the
+    # rest is safe.
     if original_s - compacted_s >= 0.2:
         print(
             f"✂️  audio_compact: {original_s:.2f}s → {compacted_s:.2f}s "
@@ -288,6 +372,12 @@ def transcribe_and_paste(session_id: str, audio: np.ndarray, translate: bool = F
     tmp.close()
     try:
         audio = compact_silence(audio)
+        if not has_real_speech(audio):
+            peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+            print(f"🔇 Skipping transcription: no real speech (peak={peak:.5f}, floor={SPEECH_PEAK_FLOOR})", flush=True)
+            emit_event("no_real_speech", session_id=session_id, peak=f"{peak:.5f}")
+            notify("Whisper", "Речь не обнаружена")
+            return
         wf.write(tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
 
         if translate:
@@ -301,6 +391,7 @@ def transcribe_and_paste(session_id: str, audio: np.ndarray, translate: bool = F
                 language="ru",
                 word_timestamps=False,
                 condition_on_previous_text=False,
+                temperature=0,
             )
             log_timing("transcribe_ru", started)
             text = result["text"].strip()
@@ -309,9 +400,15 @@ def transcribe_and_paste(session_id: str, audio: np.ndarray, translate: bool = F
                 _runtime_state.mark_translating()
                 emit_event("translate_start", session_id=session_id)
                 started = time.perf_counter()
-                text = get_translator().translate(text)
-                log_timing("translate_ru_en", started)
-                print(f"⚙️  → EN: {text}", flush=True)
+                try:
+                    text = translate_with_timeout(text)
+                    log_timing("translate_ru_en", started)
+                    print(f"⚙️  → EN: {text}", flush=True)
+                except Exception as exc:
+                    log_timing("translate_ru_en", started)
+                    print(f"⚠️  Translate failed ({exc}); pasting RU text", flush=True)
+                    emit_event("translate_failed", session_id=session_id, error=str(exc))
+                    notify("Whisper", "Перевод недоступен — вставлен русский текст")
         else:
             _runtime_state.mark_transcribing()
             emit_event("transcribe_start", session_id=session_id, mode="dictation")
@@ -320,9 +417,10 @@ def transcribe_and_paste(session_id: str, audio: np.ndarray, translate: bool = F
             result = mlx_whisper.transcribe(
                 tmp.name,
                 path_or_hf_repo=MODEL,
-                language=None,
+                language="ru",
                 word_timestamps=False,
                 condition_on_previous_text=False,
+                temperature=0,
             )
             log_timing("transcribe", started)
             text = result["text"].strip()
@@ -332,6 +430,10 @@ def transcribe_and_paste(session_id: str, audio: np.ndarray, translate: bool = F
             return
         if is_hallucination_loop(text):
             print(f"⚠️  Hallucination loop detected ({len(text.split())} words), discarding", flush=True)
+            return
+        if is_hallucination_phrase(text):
+            print(f"⚠️  Hallucination phrase detected ({text!r}), discarding", flush=True)
+            emit_event("hallucination_discarded", session_id=session_id, text=text)
             return
 
         text = apply_punct_commands(text)
