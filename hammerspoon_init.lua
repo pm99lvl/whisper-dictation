@@ -2,6 +2,8 @@
 
 local PYTHON       = "/Users/a1/.pyenv/versions/3.11.11/bin/python3"
 local DAEMON       = "/Users/a1/.whisper-dictation/dictate_daemon.py"
+local OVERLAY      = "/Users/a1/.whisper-dictation/whisper_overlay.py"
+local OVERLAY_FILE = "/tmp/whisper_overlay.json"
 local LOG          = "/tmp/whisper_dictation.log"
 local HS_LOG       = "/tmp/whisper_hammerspoon.log"
 local SOCKET       = "/tmp/whisper_daemon.sock"
@@ -13,20 +15,14 @@ local FOCUS_FILE   = "/tmp/whisper_focus_app.txt"
 local LALT         = 58
 local RALT         = 61
 
-local styleRed = {
-    fillColor={red=0,green=0,blue=0,alpha=0.88},
-    strokeColor={red=1,green=0.2,blue=0.2,alpha=1},
-    strokeWidth=3, textColor={white=1,alpha=1}, textSize=22, radius=12,
-    fadeInDuration=0.08, fadeOutDuration=0.25,
-}
-local styleGreen = hs.fnutils.copy(styleRed)
-styleGreen.strokeColor = {red=0.2,green=0.85,blue=0.2,alpha=1}
-local styleGray = hs.fnutils.copy(styleRed)
-styleGray.strokeColor = {red=0.5,green=0.5,blue=0.5,alpha=1}
+-- Status styles are now just colour names handed to the overlay helper.
+local styleRed   = "red"
+local styleGreen = "green"
+local styleGray  = "gray"
 
-local alertId = nil
 local alertType = nil -- dictating | transcribing | translate_dictating | translate_transcribing | nil
 local sessionStarted = false
+local overlayClearTimer = nil
 
 local function hsLog(message)
     local f = io.open(HS_LOG, "a")
@@ -35,14 +31,55 @@ local function hsLog(message)
     f:close()
 end
 
+-- ── Screenshot-invisible status overlay ─────────────────────────────
+-- whisper_overlay.py draws the banner in an NSWindowSharingNone window, so it is
+-- omitted from every screen capture (macOS screenshot, Monosnap, the Claude app's
+-- capture button, ScreenCaptureKit, …) while staying visible live. Hammerspoon
+-- just publishes the desired text/colour to OVERLAY_FILE.
+local function jsonEscape(s)
+    return (s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t"))
+end
+
+local function overlayWrite(text, style)
+    local f = io.open(OVERLAY_FILE, "w")
+    if not f then return end
+    f:write(string.format('{"text":"%s","style":"%s"}', jsonEscape(text or ""), style or "gray"))
+    f:close()
+end
+
+local function overlayHide()
+    if overlayClearTimer then overlayClearTimer:stop(); overlayClearTimer = nil end
+    overlayWrite("", "gray")
+end
+
+-- seconds >= 90 means "persistent until closed" (matches old hs.alert 99s usage).
+local function overlayShow(text, style, seconds)
+    if overlayClearTimer then overlayClearTimer:stop(); overlayClearTimer = nil end
+    overlayWrite(text, style)
+    if seconds and seconds < 90 then
+        overlayClearTimer = hs.timer.doAfter(seconds, overlayHide)
+    end
+end
+
+local function isOverlayRunning()
+    -- [w] bracket trick: the pattern must not match hs.execute's own shell wrapper,
+    -- whose command line literally contains "whisper_overlay.py".
+    local rc = hs.execute("pgrep -f '[w]hisper_overlay.py' >/dev/null 2>&1; echo $?")
+    return rc and rc:match("^0") ~= nil
+end
+
+local function startOverlay()
+    if isOverlayRunning() then return end
+    hs.execute("PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin nohup " .. PYTHON .. " " .. OVERLAY .. " >/tmp/whisper_overlay_helper.log 2>&1 &")
+end
+
 local function closeAlert()
-    if alertId then hs.alert.closeSpecific(alertId); alertId = nil end
+    overlayHide()
 end
 
 local function showAlert(kind, text, style, seconds)
-    closeAlert()
     alertType = kind
-    alertId = hs.alert.show(text, style, seconds)
+    overlayShow(text, style, seconds)
 end
 
 local function sendCmd(cmd)
@@ -83,21 +120,21 @@ end
 
 local function startDaemon()
     if isDaemonAlive() then
-        hs.alert.show("  🎙  Whisper готов\n  Удержи Alt = запись  ", styleGreen, 3)
+        showAlert(nil, "  🎙  Whisper готов\n  Удержи Alt = запись  ", styleGreen, 3)
         return
     end
     if isDaemonProcessRunning() then
-        hs.alert.show("  ⏳  Модель грузится...  ", styleGray, 3)
+        showAlert(nil, "  ⏳  Модель грузится...  ", styleGray, 3)
         return
     end
     killOldDaemons()
-    hs.alert.show("  ⏳  Загружаю модель Whisper...  ", styleGray, 9)
+    showAlert(nil, "  ⏳  Загружаю модель Whisper...  ", styleGray, 9)
     hs.execute("PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin " .. PYTHON .. " " .. DAEMON .. " >> " .. LOG .. " 2>&1 &")
     hs.timer.doAfter(9, function()
         if isDaemonAlive() then
-            hs.alert.show("  🎙  Whisper готов!\n  Удержи Alt = запись  ", styleGreen, 3)
+            showAlert(nil, "  🎙  Whisper готов!\n  Удержи Alt = запись  ", styleGreen, 3)
         else
-            hs.alert.show("  ❌  Демон не запустился — проверь лог  ", styleRed, 5)
+            showAlert(nil, "  ❌  Демон не запустился — проверь лог  ", styleRed, 5)
         end
     end)
 end
@@ -161,7 +198,7 @@ whisperTranslateTap:start()
 
 -- Auto-hide only recording alerts. Do not kill transcribing/translation alerts early.
 hs.timer.new(0.5, function()
-    if alertId and (alertType == "dictating" or alertType == "translate_dictating") and not isRecording() then
+    if (alertType == "dictating" or alertType == "translate_dictating") and not isRecording() then
         closeAlert()
         alertType = nil
     end
@@ -211,32 +248,15 @@ whisperPasteWatcher = hs.pathwatcher.new("/private/tmp", function(paths)
 end)
 whisperPasteWatcher:start()
 
-local screenshotKeys = {[20]=true, [21]=true, [23]=true} -- Cmd+Shift+3/4/5
-screenshotTap = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(event)
-    local flags = event:getFlags()
-    if not screenshotKeys[event:getKeyCode()] or not (flags.cmd and flags.shift) then return false end
-    local savedType = alertType
-    closeAlert()
-    hs.alert.closeAll()
-    hs.timer.doAfter(0.7, function()
-        if savedType == "dictating" and isRecording() then
-            showAlert("dictating", "  🎙  Диктую...  ", styleRed, 99)
-        elseif savedType == "translate_dictating" and isRecording() then
-            showAlert("translate_dictating", "  🌐  Диктую → EN...  ", styleRed, 99)
-        elseif savedType == "transcribing" then
-            showAlert("transcribing", "  ⚙️  Транскрибирую...  ", styleGreen, 4)
-        elseif savedType == "translate_transcribing" then
-            showAlert("translate_transcribing", "  ⚙️  Перевожу на EN...  ", styleGreen, 4)
-        end
-    end)
-    return false
-end)
-screenshotTap:start()
+-- No more Cmd+Shift+3/4/5 interception: the overlay window is excluded from every
+-- capture at the OS level (NSWindowSharingNone), and that hook never covered the
+-- Claude app's capture button (which fires no key event) anyway.
 
--- Watchdog: keep daemon alive and refresh status snapshot without touching active recordings.
+-- Watchdog: keep daemon + overlay alive and refresh status snapshot.
 daemonWatchdog = hs.timer.new(60, function()
+    startOverlay()
     if not isDaemonAlive() and not isDaemonProcessRunning() then
-        hs.alert.show("  ⚠️  Whisper демон умер — перезапускаю...  ", styleGray, 3)
+        showAlert(nil, "  ⚠️  Whisper демон умер — перезапускаю...  ", styleGray, 3)
         startDaemon()
     else
         daemonStatus()
@@ -244,5 +264,6 @@ daemonWatchdog = hs.timer.new(60, function()
 end)
 daemonWatchdog:start()
 
+startOverlay()
 startDaemon()
 require("hs.ipc")
