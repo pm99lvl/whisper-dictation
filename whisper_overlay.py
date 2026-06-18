@@ -36,7 +36,7 @@ from AppKit import (
     NSWindowCollectionBehaviorStationary,
     NSWindowSharingNone,
 )
-from Foundation import NSMakePoint, NSObject, NSTimer
+from Foundation import NSMakePoint, NSObject, NSString, NSTimer
 
 STATE_FILE = Path("/tmp/whisper_overlay.json")
 
@@ -114,7 +114,8 @@ class Overlay(NSObject):
             self._build_window()
         rgb = STYLE_BORDERS.get(style, STYLE_BORDERS["gray"])
         font = NSFont.systemFontOfSize_(22.0)
-        size = (text or " ").sizeWithAttributes_({NSFontAttributeName: font})
+        # Measure via a real NSString — a Python str has no sizeWithAttributes_.
+        size = NSString.stringWithString_(text or " ").sizeWithAttributes_({NSFontAttributeName: font})
         pad_x, pad_y = 28.0, 17.0
         w = float(size.width) + 2 * pad_x
         h = float(size.height) + 2 * pad_y
