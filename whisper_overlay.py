@@ -21,14 +21,15 @@ import objc
 from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
+    NSAttributedString,
     NSBackingStoreBuffered,
     NSBezierPath,
     NSColor,
     NSFont,
     NSFontAttributeName,
+    NSForegroundColorAttributeName,
     NSMakeRect,
     NSScreen,
-    NSTextField,
     NSView,
     NSWindow,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -40,23 +41,25 @@ from Foundation import NSMakePoint, NSObject, NSString, NSTimer
 
 STATE_FILE = Path("/tmp/whisper_overlay.json")
 
-# Borderless + above normal windows, but never interactive and never captured.
 NS_WINDOW_STYLE_BORDERLESS = 0
 NS_STATUS_WINDOW_LEVEL = 25  # NSStatusWindowLevel: above menus/most panels
 
 STYLE_BORDERS = {
-    "red": (1.0, 0.2, 0.2),
+    "red":   (1.0, 0.2, 0.2),
     "green": (0.2, 0.85, 0.2),
-    "gray": (0.5, 0.5, 0.5),
+    "gray":  (0.5, 0.5, 0.5),
 }
 
 
 class BannerView(NSView):
-    def initWithBorder_(self, rgb):  # noqa: N802 - objc selector
+    """Draws the rounded-rect background, border, and text all in drawRect_."""
+
+    def initWithText_style_(self, text, style):  # noqa: N802 - objc selector
         self = objc.super(BannerView, self).init()
         if self is None:
             return None
-        self._rgb = rgb
+        self._text = text
+        self._rgb = STYLE_BORDERS.get(style, STYLE_BORDERS["gray"])
         return self
 
     def drawRect_(self, rect):  # noqa: N802 - objc selector
@@ -69,12 +72,24 @@ class BannerView(NSView):
             rect.size.height - 2 * inset,
         )
         path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(body, radius, radius)
-        NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.88).setFill()
+        NSColor.colorWithCalibratedWhite_alpha_(0.08, 0.92).setFill()
         path.fill()
         r, g, b = self._rgb
         NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0).setStroke()
         path.setLineWidth_(3.0)
         path.stroke()
+
+        # Draw text centred in the view.
+        font = NSFont.boldSystemFontOfSize_(20.0)
+        attrs = {
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: NSColor.whiteColor(),
+        }
+        astr = NSAttributedString.alloc().initWithString_attributes_(self._text, attrs)
+        ts = astr.size()
+        tx = (rect.size.width - ts.width) / 2.0
+        ty = (rect.size.height - ts.height) / 2.0
+        astr.drawAtPoint_(NSMakePoint(tx, ty))
 
 
 class Overlay(NSObject):
@@ -87,7 +102,9 @@ class Overlay(NSObject):
         return self
 
     @objc.python_method
-    def _build_window(self):
+    def _ensure_window(self):
+        if self._window is not None:
+            return
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, 200, 56),
             NS_WINDOW_STYLE_BORDERLESS,
@@ -110,31 +127,16 @@ class Overlay(NSObject):
 
     @objc.python_method
     def _render(self, text, style):
-        if self._window is None:
-            self._build_window()
-        rgb = STYLE_BORDERS.get(style, STYLE_BORDERS["gray"])
-        font = NSFont.systemFontOfSize_(22.0)
-        # Measure via a real NSString — a Python str has no sizeWithAttributes_.
-        size = NSString.stringWithString_(text or " ").sizeWithAttributes_({NSFontAttributeName: font})
-        pad_x, pad_y = 28.0, 17.0
+        self._ensure_window()
+        font = NSFont.boldSystemFontOfSize_(20.0)
+        attrs = {NSFontAttributeName: font}
+        size = NSString.stringWithString_(text or " ").sizeWithAttributes_(attrs)
+        pad_x, pad_y = 28.0, 18.0
         w = float(size.width) + 2 * pad_x
         h = float(size.height) + 2 * pad_y
 
-        frame = NSMakeRect(0, 0, w, h)
-        view = BannerView.alloc().initWithBorder_(rgb)
-        view.setFrame_(frame)
-
-        label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(pad_x, pad_y - 2, float(size.width), float(size.height))
-        )
-        label.setStringValue_(text)
-        label.setBezeled_(False)
-        label.setDrawsBackground_(False)
-        label.setEditable_(False)
-        label.setSelectable_(False)
-        label.setFont_(font)
-        label.setTextColor_(NSColor.whiteColor())
-        view.addSubview_(label)
+        view = BannerView.alloc().initWithText_style_(text, style)
+        view.setFrame_(NSMakeRect(0, 0, w, h))
 
         self._window.setContentSize_((w, h))
         self._window.setContentView_(view)
@@ -143,7 +145,7 @@ class Overlay(NSObject):
         if screen is not None:
             vf = screen.frame()
             x = vf.origin.x + (vf.size.width - w) / 2.0
-            y = vf.origin.y + vf.size.height * 0.62  # roughly where hs.alert sat
+            y = vf.origin.y + vf.size.height * 0.62
             self._window.setFrameOrigin_(NSMakePoint(x, y))
         self._window.orderFrontRegardless()
 
@@ -184,7 +186,7 @@ class Overlay(NSObject):
 
 def main():
     app = NSApplication.sharedApplication()
-    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)  # no Dock icon
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     overlay = Overlay.alloc().init()
     overlay.start()
     app.run()
