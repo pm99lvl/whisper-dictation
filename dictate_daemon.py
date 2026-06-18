@@ -30,6 +30,7 @@ from dictation_runtime import RuntimeState, cleanup_stale_files, is_process_aliv
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
 ACTIVE_MODE, ACTIVE_PRESET = get_active_preset()
+ENGINE = ACTIVE_PRESET.get("engine", "whisper")
 MODEL = os.getenv("WHISPER_MODEL", ACTIVE_PRESET["model"])
 SAMPLE_RATE = 16000
 MAX_SECONDS = int(os.getenv("WHISPER_MAX_SECONDS", str(ACTIVE_PRESET["max_seconds"])))
@@ -72,18 +73,68 @@ import numpy as np
 import scipy.io.wavfile as wf
 import sounddevice as sd
 from deep_translator import GoogleTranslator
-import mlx_whisper
 
-# ── Preload model once ──────────────────────────────────────────────
-print(f"⏳ Loading model: {MODEL}", flush=True)
-_warmup = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-_warmup.close()
-try:
-    wf.write(_warmup.name, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
-    mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language="ru", word_timestamps=False, temperature=0)
-finally:
-    with suppress(FileNotFoundError):
-        os.unlink(_warmup.name)
+# ── Load ASR model once ──────────────────────────────────────────────
+print(f"⏳ Loading model: {MODEL} (engine={ENGINE})", flush=True)
+
+_SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]+\|>")
+
+if ENGINE == "sensevoice":
+    from funasr import AutoModel as _FunASRAutoModel
+    # FunASR needs a local path when ModelScope is unavailable.
+    # MODEL is "iic/SenseVoiceSmall"; resolve to local cache first.
+    import pathlib as _pathlib
+    _sv_local = _pathlib.Path.home() / ".cache/modelscope/hub/models" / MODEL
+    _sv_model_path = str(_sv_local) if _sv_local.exists() else MODEL
+    _sv_model = _FunASRAutoModel(
+        model=_sv_model_path,
+        trust_remote_code=False,
+        disable_update=True,
+        device="cpu",
+    )
+
+    def _do_transcribe(audio: np.ndarray) -> str:
+        """Transcribe float32 mono 16 kHz audio via SenseVoice."""
+        res = _sv_model.generate(
+            input=audio,
+            cache={},
+            language="auto",
+            use_itn=True,
+            batch_size_s=60,
+        )
+        raw = res[0]["text"] if res else ""
+        return _SENSEVOICE_TAG_RE.sub("", raw).strip()
+
+else:
+    import mlx_whisper
+    _warmup = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    _warmup.close()
+    try:
+        wf.write(_warmup.name, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
+        mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language="ru", word_timestamps=False, temperature=0)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(_warmup.name)
+
+    def _do_transcribe(audio: np.ndarray) -> str:
+        """Transcribe float32 mono 16 kHz audio via MLX Whisper (WAV file)."""
+        _tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        _tmp.close()
+        try:
+            wf.write(_tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+            result = mlx_whisper.transcribe(
+                _tmp.name,
+                path_or_hf_repo=MODEL,
+                language="ru",
+                word_timestamps=False,
+                condition_on_previous_text=False,
+                temperature=0,
+            )
+            return result["text"].strip()
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(_tmp.name)
+
 print("✅ Model ready.", flush=True)
 
 # ── State ───────────────────────────────────────────────────────────
@@ -368,84 +419,61 @@ def compact_silence(audio: np.ndarray) -> np.ndarray:
 
 
 def transcribe_and_paste(session_id: str, audio: np.ndarray, translate: bool = False) -> None:
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp.close()
-    try:
-        audio = compact_silence(audio)
-        if not has_real_speech(audio):
-            peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
-            print(f"🔇 Skipping transcription: no real speech (peak={peak:.5f}, floor={SPEECH_PEAK_FLOOR})", flush=True)
-            emit_event("no_real_speech", session_id=session_id, peak=f"{peak:.5f}")
-            notify("Whisper", "Речь не обнаружена")
-            return
-        wf.write(tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+    audio = compact_silence(audio)
+    if not has_real_speech(audio):
+        peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+        print(f"🔇 Skipping transcription: no real speech (peak={peak:.5f}, floor={SPEECH_PEAK_FLOOR})", flush=True)
+        emit_event("no_real_speech", session_id=session_id, peak=f"{peak:.5f}")
+        notify("Whisper", "Речь не обнаружена")
+        return
 
-        if translate:
-            _runtime_state.mark_transcribing()
-            emit_event("transcribe_start", session_id=session_id, mode="translate")
-            print("⚙️  Transcribing (ru)...", flush=True)
-            started = time.perf_counter()
-            result = mlx_whisper.transcribe(
-                tmp.name,
-                path_or_hf_repo=MODEL,
-                language="ru",
-                word_timestamps=False,
-                condition_on_previous_text=False,
-                temperature=0,
-            )
-            log_timing("transcribe_ru", started)
-            text = result["text"].strip()
-            if text:
-                print(f"   RU: {text}", flush=True)
-                _runtime_state.mark_translating()
-                emit_event("translate_start", session_id=session_id)
-                started = time.perf_counter()
-                try:
-                    text = translate_with_timeout(text)
-                    log_timing("translate_ru_en", started)
-                    print(f"⚙️  → EN: {text}", flush=True)
-                except Exception as exc:
-                    log_timing("translate_ru_en", started)
-                    print(f"⚠️  Translate failed ({exc}); pasting RU text", flush=True)
-                    emit_event("translate_failed", session_id=session_id, error=str(exc))
-                    notify("Whisper", "Перевод недоступен — вставлен русский текст")
-        else:
-            _runtime_state.mark_transcribing()
-            emit_event("transcribe_start", session_id=session_id, mode="dictation")
-            print("⚙️  Transcribing...", flush=True)
-            started = time.perf_counter()
-            result = mlx_whisper.transcribe(
-                tmp.name,
-                path_or_hf_repo=MODEL,
-                language="ru",
-                word_timestamps=False,
-                condition_on_previous_text=False,
-                temperature=0,
-            )
-            log_timing("transcribe", started)
-            text = result["text"].strip()
-
-        if not text:
-            notify("Whisper", "Текст не распознан")
-            return
-        if is_hallucination_loop(text):
-            print(f"⚠️  Hallucination loop detected ({len(text.split())} words), discarding", flush=True)
-            return
-        if is_hallucination_phrase(text):
-            print(f"⚠️  Hallucination phrase detected ({text!r}), discarding", flush=True)
-            emit_event("hallucination_discarded", session_id=session_id, text=text)
-            return
-
-        text = apply_punct_commands(text)
-        print(f"✅ {text}", flush=True)
+    if translate:
+        _runtime_state.mark_transcribing()
+        emit_event("transcribe_start", session_id=session_id, mode="translate")
+        print("⚙️  Transcribing (ru)...", flush=True)
         started = time.perf_counter()
-        _runtime_state.mark_ready_to_paste()
-        write_result_for_hammerspoon(text)
-        log_timing("handoff_to_hammerspoon", started)
-        emit_event("result_ready", session_id=session_id, chars=len(text))
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(tmp.name)
+        text = _do_transcribe(audio)
+        log_timing("transcribe_ru", started)
+        if text:
+            print(f"   RU: {text}", flush=True)
+            _runtime_state.mark_translating()
+            emit_event("translate_start", session_id=session_id)
+            started = time.perf_counter()
+            try:
+                text = translate_with_timeout(text)
+                log_timing("translate_ru_en", started)
+                print(f"⚙️  → EN: {text}", flush=True)
+            except Exception as exc:
+                log_timing("translate_ru_en", started)
+                print(f"⚠️  Translate failed ({exc}); pasting RU text", flush=True)
+                emit_event("translate_failed", session_id=session_id, error=str(exc))
+                notify("Whisper", "Перевод недоступен — вставлен русский текст")
+    else:
+        _runtime_state.mark_transcribing()
+        emit_event("transcribe_start", session_id=session_id, mode="dictation")
+        print("⚙️  Transcribing...", flush=True)
+        started = time.perf_counter()
+        text = _do_transcribe(audio)
+        log_timing("transcribe", started)
+
+    if not text:
+        notify("Whisper", "Текст не распознан")
+        return
+    if is_hallucination_loop(text):
+        print(f"⚠️  Hallucination loop detected ({len(text.split())} words), discarding", flush=True)
+        return
+    if is_hallucination_phrase(text):
+        print(f"⚠️  Hallucination phrase detected ({text!r}), discarding", flush=True)
+        emit_event("hallucination_discarded", session_id=session_id, text=text)
+        return
+
+    text = apply_punct_commands(text)
+    print(f"✅ {text}", flush=True)
+    started = time.perf_counter()
+    _runtime_state.mark_ready_to_paste()
+    write_result_for_hammerspoon(text)
+    log_timing("handoff_to_hammerspoon", started)
+    emit_event("result_ready", session_id=session_id, chars=len(text))
 
 
 def enqueue_transcription(session_id: str, audio: np.ndarray, translate: bool) -> None:

@@ -9,14 +9,16 @@ from typing import Any
 PRESETS: dict[str, dict[str, Any]] = {
     "fast": {
         "name": "Fast",
-        "description": "Smaller model, quicker turnaround, lower accuracy.",
-        "model": "mlx-community/whisper-small-mlx",
+        "description": "SenseVoice — fastest Russian recognition, low latency.",
+        "engine": "sensevoice",
+        "model": "iic/SenseVoiceSmall",
         "silence_after": 2.0,
         "max_seconds": 45,
     },
     "quality": {
         "name": "Quality",
-        "description": "Better Russian recognition, slower response.",
+        "description": "Whisper large-v3-turbo — best accuracy, slower.",
+        "engine": "whisper",
         "model": "mlx-community/whisper-large-v3-turbo",
         "silence_after": 6.0,
         "max_seconds": 90,
