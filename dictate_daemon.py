@@ -24,15 +24,17 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+from dictation_modes import get_active_preset
 from dictation_runtime import RuntimeState, cleanup_stale_files, is_process_alive, write_json_atomic
 
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
-MODEL = "mlx-community/whisper-small-mlx"
+ACTIVE_MODE, ACTIVE_PRESET = get_active_preset()
+MODEL = os.getenv("WHISPER_MODEL", ACTIVE_PRESET["model"])
 SAMPLE_RATE = 16000
-MAX_SECONDS = 60          # safety guard for a stuck hotkey
+MAX_SECONDS = int(os.getenv("WHISPER_MAX_SECONDS", str(ACTIVE_PRESET["max_seconds"])))
 SPEECH_THRESHOLD = 0.0008
-SILENCE_AFTER = 2.0       # shorter auto-stop keeps dictation snappier
+SILENCE_AFTER = float(os.getenv("WHISPER_SILENCE_AFTER", str(ACTIVE_PRESET["silence_after"])))
 MIN_RECORD_TIME = 1.0
 BLOCK_SECONDS = 0.1
 EDGE_SILENCE_KEEP_SECONDS = 0.2
@@ -77,7 +79,7 @@ _warmup = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
 _warmup.close()
 try:
     wf.write(_warmup.name, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
-    mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language=None, word_timestamps=False)
+    mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language="ru", word_timestamps=False, temperature=0)
 finally:
     with suppress(FileNotFoundError):
         os.unlink(_warmup.name)
@@ -133,6 +135,8 @@ def status_payload() -> dict:
             "ok": True,
             "pid": os.getpid(),
             "model": MODEL,
+            "preset_mode": ACTIVE_MODE,
+            "preset_name": ACTIVE_PRESET["name"],
             "recording": _recording,
             "transcribing": _transcribing,
             "queue_size": _transcription_queue.qsize(),
@@ -268,6 +272,13 @@ def compact_silence(audio: np.ndarray) -> np.ndarray:
     compacted = np.concatenate(kept).flatten() if kept else audio
     original_s = len(audio) / SAMPLE_RATE
     compacted_s = len(compacted) / SAMPLE_RATE
+    if compacted_s < original_s * 0.5:
+        print(
+            f"⚠️  audio_compact: too aggressive "
+            f"({original_s:.2f}s → {compacted_s:.2f}s), keeping original",
+            flush=True,
+        )
+        return audio
     if original_s - compacted_s >= 0.2:
         print(
             f"✂️  audio_compact: {original_s:.2f}s → {compacted_s:.2f}s "
@@ -301,6 +312,7 @@ def transcribe_and_paste(session_id: str, audio: np.ndarray, translate: bool = F
                 language="ru",
                 word_timestamps=False,
                 condition_on_previous_text=False,
+                temperature=0,
             )
             log_timing("transcribe_ru", started)
             text = result["text"].strip()
@@ -320,9 +332,10 @@ def transcribe_and_paste(session_id: str, audio: np.ndarray, translate: bool = F
             result = mlx_whisper.transcribe(
                 tmp.name,
                 path_or_hf_repo=MODEL,
-                language=None,
+                language="ru",
                 word_timestamps=False,
                 condition_on_previous_text=False,
+                temperature=0,
             )
             log_timing("transcribe", started)
             text = result["text"].strip()
