@@ -16,7 +16,7 @@ from dictation_modes import get_active_preset
 
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
-PID_FILE = "/tmp/whisper_daemon.pid"
+PID_FILE = "/tmp/whisper_standalone.pid"
 with open(PID_FILE, "w") as f:
     f.write(str(os.getpid()))
 

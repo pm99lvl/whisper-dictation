@@ -29,6 +29,8 @@ Changing the mode writes `~/.whisper-dictation/dictation_mode.json` and restarts
 
 ## Quality mode
 
+This checkout now defaults to a quality-first preset:
+
 ```python
 MODEL = "mlx-community/whisper-large-v3-turbo"
 SILENCE_AFTER = 6.0

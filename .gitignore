@@ -8,3 +8,6 @@ __pycache__/
 /tmp/
 *.wav
 *.log
+
+# runtime preset state
+dictation_mode.json
