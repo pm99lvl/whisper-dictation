@@ -30,7 +30,6 @@ from dictation_runtime import RuntimeState, cleanup_stale_files, is_process_aliv
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
 ACTIVE_MODE, ACTIVE_PRESET = get_active_preset()
-ENGINE = ACTIVE_PRESET.get("engine", "whisper")
 MODEL = os.getenv("WHISPER_MODEL", ACTIVE_PRESET["model"])
 SAMPLE_RATE = 16000
 MAX_SECONDS = int(os.getenv("WHISPER_MAX_SECONDS", str(ACTIVE_PRESET["max_seconds"])))
@@ -69,71 +68,73 @@ if removed_startup_artifacts:
 # Write PID before model preload so Hammerspoon does not kill us while loading.
 PID_FILE.write_text(str(os.getpid()))
 
+import urllib.request
 import numpy as np
 import scipy.io.wavfile as wf
 import sounddevice as sd
 from deep_translator import GoogleTranslator
 
-# ── Load ASR model once ──────────────────────────────────────────────
-print(f"⏳ Loading model: {MODEL} (engine={ENGINE})", flush=True)
+# ── Start whisper-server (keeps model in RAM, Metal GPU) ─────────────
+WHISPERCPP_BIN  = os.getenv("WHISPERCPP_BIN", "/opt/homebrew/bin/whisper-server")
+WHISPERCPP_URL  = os.getenv("WHISPERCPP_URL", "http://127.0.0.1:7070")
+WHISPERCPP_PORT = "7070"
 
-_SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]+\|>")
+print(f"⏳ Loading model: {MODEL}", flush=True)
 
-if ENGINE == "sensevoice":
-    from funasr import AutoModel as _FunASRAutoModel
-    # FunASR needs a local path when ModelScope is unavailable.
-    # MODEL is "iic/SenseVoiceSmall"; resolve to local cache first.
-    import pathlib as _pathlib
-    _sv_local = _pathlib.Path.home() / ".cache/modelscope/hub/models" / MODEL
-    _sv_model_path = str(_sv_local) if _sv_local.exists() else MODEL
-    _sv_model = _FunASRAutoModel(
-        model=_sv_model_path,
-        trust_remote_code=False,
-        disable_update=True,
-        device="cpu",
-    )
-
-    def _do_transcribe(audio: np.ndarray) -> str:
-        """Transcribe float32 mono 16 kHz audio via SenseVoice."""
-        res = _sv_model.generate(
-            input=audio,
-            cache={},
-            language="auto",
-            use_itn=True,
-            batch_size_s=60,
-        )
-        raw = res[0]["text"] if res else ""
-        return _SENSEVOICE_TAG_RE.sub("", raw).strip()
-
-else:
-    import mlx_whisper
-    _warmup = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    _warmup.close()
+def _start_whisper_server() -> None:
     try:
-        wf.write(_warmup.name, SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.int16))
-        mlx_whisper.transcribe(_warmup.name, path_or_hf_repo=MODEL, language="ru", word_timestamps=False, temperature=0)
+        urllib.request.urlopen(f"{WHISPERCPP_URL}/", timeout=1)
+        print("✅ whisper-server already running", flush=True)
+        return
+    except Exception:
+        pass
+    print("⏳ Starting whisper-server...", flush=True)
+    subprocess.Popen(
+        [WHISPERCPP_BIN, "--model", MODEL, "--language", "ru",
+         "--host", "127.0.0.1", "--port", WHISPERCPP_PORT],
+        stdout=open("/tmp/whisper_server.log", "a"),
+        stderr=subprocess.STDOUT,
+    )
+    for _ in range(40):
+        try:
+            urllib.request.urlopen(f"{WHISPERCPP_URL}/", timeout=1)
+            print("✅ whisper-server ready", flush=True)
+            return
+        except Exception:
+            time.sleep(0.5)
+    print("⚠️  whisper-server did not start in time", flush=True)
+
+_start_whisper_server()
+
+
+def _do_transcribe(audio: np.ndarray) -> str:
+    _tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    _tmp.close()
+    try:
+        wf.write(_tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+        boundary = "----WB"
+        wav_bytes = Path(_tmp.name).read_bytes()
+        body = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+            f"filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        ).encode() + wav_bytes + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            f"{WHISPERCPP_URL}/inference",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode())
+        text = data.get("text", "").strip()
+        # whisper.cpp inserts \n at ~80-char boundaries — collapse to spaces
+        text = " ".join(text.splitlines())
+        return text
+    except Exception as exc:
+        print(f"⚠️  whisper-server error: {exc}", flush=True)
+        return ""
     finally:
         with suppress(FileNotFoundError):
-            os.unlink(_warmup.name)
-
-    def _do_transcribe(audio: np.ndarray) -> str:
-        """Transcribe float32 mono 16 kHz audio via MLX Whisper (WAV file)."""
-        _tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        _tmp.close()
-        try:
-            wf.write(_tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
-            result = mlx_whisper.transcribe(
-                _tmp.name,
-                path_or_hf_repo=MODEL,
-                language="ru",
-                word_timestamps=False,
-                condition_on_previous_text=False,
-                temperature=0,
-            )
-            return result["text"].strip()
-        finally:
-            with suppress(FileNotFoundError):
-                os.unlink(_tmp.name)
+            os.unlink(_tmp.name)
 
 print("✅ Model ready.", flush=True)
 

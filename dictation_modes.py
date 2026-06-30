@@ -6,27 +6,29 @@ import time
 from pathlib import Path
 from typing import Any
 
+MODELS_DIR = Path(__file__).parent / "models"
+
 PRESETS: dict[str, dict[str, Any]] = {
     "fast": {
         "name": "Fast",
-        "description": "SenseVoice — fastest Russian recognition, low latency.",
-        "engine": "sensevoice",
-        "model": "iic/SenseVoiceSmall",
+        "description": "whisper.cpp small — Metal GPU, fastest.",
+        "engine": "whispercpp",
+        "model": str(MODELS_DIR / "ggml-small.bin"),
         "silence_after": 2.0,
         "max_seconds": 45,
     },
     "quality": {
         "name": "Quality",
-        "description": "Whisper large-v3-turbo — best accuracy, slower.",
-        "engine": "whisper",
-        "model": "mlx-community/whisper-large-v3-turbo",
+        "description": "whisper.cpp large-v3-turbo — Metal GPU, best accuracy.",
+        "engine": "whispercpp",
+        "model": str(MODELS_DIR / "ggml-large-v3-turbo.bin"),
         "silence_after": 6.0,
         "max_seconds": 90,
     },
 }
 
-DEFAULT_MODE = "quality"
-CONFIG_PATH = Path.home() / ".whisper-dictation" / "dictation_mode.json"
+DEFAULT_MODE = "fast"
+CONFIG_PATH = Path.home() / ".config" / "whisper-dictation" / "mode.json"
 
 
 def normalize_mode(mode: str | None) -> str:
@@ -63,4 +65,3 @@ def write_mode(mode: str) -> str:
     }
     CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return normalized
-

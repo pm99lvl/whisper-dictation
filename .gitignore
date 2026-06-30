@@ -11,3 +11,5 @@ __pycache__/
 
 # runtime preset state
 dictation_mode.json
+models/*.bin
+models/*.gguf
